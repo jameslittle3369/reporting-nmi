@@ -1,0 +1,6 @@
+requests
+pyodbc
+boto3
+matplotlib
+python-dotenv
+tzdata
