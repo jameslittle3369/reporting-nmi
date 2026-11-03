@@ -107,8 +107,8 @@ many.
 **Table:** website > merchant > provider, with subtotals on website and merchant
 rows. Providers are the `usr_processors` rows with `cc_gateway='N'`.
 
-**Charts:** Volume by Merchant (captures plus sales), Card Brands, Decline
-Reasons. Empty ones are listed in a compact "No activity in this period" note.
+**Charts:** Volume by Website and Volume by Merchant (captures plus sales),
+Card Brands, Decline Reasons. Empty ones are listed in a compact "No activity in this period" note.
 
 ---
 

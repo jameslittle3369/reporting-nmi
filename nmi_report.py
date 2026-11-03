@@ -276,7 +276,7 @@ def debug_sample(tx):
 # Metric collection
 # ---------------------------------------------------------------------------
 
-def tally(tx, stats, start_dt, end_dt, breakdowns, merchant):
+def tally(tx, stats, start_dt, end_dt, breakdowns, row):
     """Adds one transaction's in-window actions to stats. A capture counts on
     its own date, so it can belong to an auth from an earlier day; an auth's
     captured/pending status uses the transaction's full history, so a capture
@@ -308,12 +308,14 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, merchant):
             stats["captures"] += 1
             stats["captures_amt"] += amt
             stats["captures_voided"] += voided
-            breakdowns["volume"][merchant] += amt
+            breakdowns["website_volume"][row["website"]] += amt
+            breakdowns["volume"][row["merchant"]] += amt
         elif kind == "sale":
             stats["sales"] += 1
             stats["sales_amt"] += amt
             stats["sales_voided"] += voided
-            breakdowns["volume"][merchant] += amt
+            breakdowns["website_volume"][row["website"]] += amt
+            breakdowns["volume"][row["merchant"]] += amt
             breakdowns["brands"][tx["cc_type"] or None] += 1
         elif kind in ("refund", "credit"):
             stats["refunds"] += 1
@@ -360,7 +362,7 @@ def collect(logins, start_dt, end_dt, breakdowns, notes):
                 row = rows[0]
                 if len(rows) > 1:
                     unmatched[(tx["processor_id"] or "(blank)", label)] += 1
-            tally(tx, row["stats"], start_dt, end_dt, breakdowns, row["merchant"])
+            tally(tx, row["stats"], start_dt, end_dt, breakdowns, row)
 
     if other_currency:
         notes.append(f"Amounts are in {CURRENCY.upper()}. Excluded "
@@ -730,13 +732,14 @@ def main():
 
     print(f"Fetching NMI transactions ({days}-day window) ...")
     notes = []
-    breakdowns = {"volume": Counter(), "brands": Counter(), "declines": Counter()}
+    breakdowns = {"website_volume": Counter(), "volume": Counter(), "brands": Counter(), "declines": Counter()}
     failed = collect(logins, start_dt, end_dt, breakdowns, notes)
     if len(failed) == len(logins):
         raise SystemExit("Every gateway login failed - not sending a report.")
 
     print("Building charts ...")
     specs = [
+        bar_spec("Volume by Website", breakdowns["website_volume"], "money", labeler=lambda k: k),
         bar_spec("Volume by Merchant", breakdowns["volume"], "money", labeler=lambda k: k),
         bar_spec("Card Brands", breakdowns["brands"]),
         bar_spec("Decline Reasons", breakdowns["declines"], labeler=lambda k: k),
