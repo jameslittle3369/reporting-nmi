@@ -47,6 +47,7 @@ import email.mime.text
 import boto3
 import pyodbc
 import requests
+import stripe
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -68,6 +69,9 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 NMI_QUERY_URL = os.getenv("NMI_QUERY_URL", "https://secure.networkmerchants.com/api/query.php")
 # Comma-separated agentid:url pairs, for merchants on a private-label host.
 NMI_URL_OVERRIDES = dict(p.strip().split(":", 1) for p in os.getenv("NMI_URL_OVERRIDES", "").split(",") if p.strip())
+
+# Used for usr_processors rows with cc_gateway='S'.
+STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
 
 AWS_REGION            = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -93,12 +97,23 @@ CURRENCY = "usd"
 RESULT_LIMIT = 1000
 ACCOUNTS_SQL = """
     select p.agentid, m.FirstName merchant, p.site_agentid, s.FirstName website,
-           p.company_name, p.gateway_id, p.cc_gateway_username, p.cc_gateway_password
+           p.company_name, p.gateway_id, p.cc_gateway, p.cc_gateway_username, p.cc_gateway_password
     from usr_processors p with (nolock)
     left join usr_agents m with (nolock) on p.agentid = m.AgentId
     left join usr_agents s with (nolock) on p.site_agentid = s.AgentId
-    where p.cc_gateway = 'N'
+    where p.cc_gateway in ('N', 'S', 'D')
 """
+# SlimCD reports web service (Transaction Gateway Manual, "Reports"). Its
+# transaction dates are US Eastern; UserName is the numeric ClientID.
+SLIMCD_URL = "https://stats.slimcd.com/wswebservices/reports.asmx/"
+SLIMCD_TZ = ZoneInfo("America/New_York")
+SLIMCD_MAX_RECORDS = 50000
+SLIMCD_BRANDS = {"V": "visa", "M": "mastercard", "A": "amex", "D": "discover"}
+# Stripe balance transaction types (see Reporting\Stripe\stripe_report.py).
+STRIPE_PAYOUT_TYPES = {"payout", "payout_cancel", "payout_failure", "payout_minimum_balance_hold",
+                       "payout_minimum_balance_release"}
+STRIPE_CHARGE_TYPES = {"charge", "payment"}
+STRIPE_REFUND_TYPES = {"refund", "payment_refund"}
 
 
 def safe_id(s: str) -> str:
@@ -139,8 +154,8 @@ def plural(n, word) -> str:
 
 def load_logins():
     """One entry per distinct gateway login, each with its usr_processors rows.
-    Rows can share a login (660's Flex row does), so querying per row would
-    double-count that login's transactions."""
+    Rows can share a login, so querying per row would double-count that
+    login's transactions. Stripe rows ('S') share the one STRIPE_API_KEY."""
     if DB_TRUSTED_CONNECTION:
         auth = "Trusted_Connection=yes"
     else:
@@ -154,9 +169,11 @@ def load_logins():
     logins = {}
     for r in rows:
         agentid, site_agentid = (r.agentid or "").strip(), (r.site_agentid or "").strip()
-        key = (r.cc_gateway_username, r.cc_gateway_password)
+        gateway = {"S": "stripe", "D": "slimcd"}.get(r.cc_gateway, "nmi")
+        key = (gateway,) if gateway == "stripe" else (gateway, r.cc_gateway_username, r.cc_gateway_password)
         login = logins.setdefault(key, {
-            "username": r.cc_gateway_username, "password": r.cc_gateway_password,
+            "gateway": gateway,
+            "username": r.cc_gateway_username or "", "password": r.cc_gateway_password or "",
             "url": NMI_URL_OVERRIDES.get(agentid, NMI_QUERY_URL), "rows": [],
         })
         login["rows"].append({
@@ -165,6 +182,7 @@ def load_logins():
             "provider": (r.company_name or "Unknown").strip(),
             "gateway_id": (r.gateway_id or "").strip(),
             "stats": Counter(),
+            "extras": None,  # Stripe-only payouts / fees / disputes
             "unavailable": False,
         })
     return list(logins.values())
@@ -294,6 +312,7 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
         if kind == "auth":
             if voided:  # released without capture; left out of the total, matching the Stripe report
                 stats["released"] += 1
+                stats["released_amt"] += amt
                 continue
             stats["auths"] += 1
             stats["auths_amt"] += amt
@@ -323,8 +342,211 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
 
     for a in tx["actions"]:
         if not a["success"] and a["type"] in ("auth", "sale") and in_window(a):
-            reason = re.sub(r"\s*REFID:\S+", "", a["response_text"]).strip()
-            breakdowns["declines"][reason or "Unknown"] += 1
+            add_decline(breakdowns, re.sub(r"\s*REFID:\S+", "", a["response_text"]).strip())
+
+
+def add_decline(breakdowns, reason):
+    """Counts decline reasons case-insensitively, so NMI's 'Insufficient funds'
+    and Stripe's insufficient_funds share one bar (labelled as first seen)."""
+    reason = reason or "Unknown"
+    breakdowns["declines"][reason.lower()] += 1
+    breakdowns["decline_labels"].setdefault(reason.lower(), reason)
+
+
+# ---------------------------------------------------------------------------
+# Stripe (usr_processors rows with cc_gateway='S')
+# ---------------------------------------------------------------------------
+
+def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
+    """Fills one row from Stripe, using the Stripe report's definitions: auths
+    are the window's succeeded charges (released ones excluded), captures and
+    refunds are the window's balance transactions, so a capture counts on its
+    own day like NMI's. Payouts, fees and disputes have no NMI equivalent and go
+    in row["extras"]. Returns a short summary for the console."""
+    if not STRIPE_API_KEY:
+        raise GatewayError("STRIPE_API_KEY not set in .env")
+    client = stripe.StripeClient(STRIPE_API_KEY, max_network_retries=3)
+    start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
+    created = {"created": {"gte": start_ts, "lt": end_ts}}
+
+    def fetch(service, params):
+        try:
+            items = [o.to_dict() for o in service.list({**params, "limit": 100}).auto_paging_iter()]
+        except stripe.StripeError as e:
+            raise GatewayError(f"{type(e).__name__}: {e.user_message or e}") from None
+        usd = [o for o in items if (o.get("currency") or CURRENCY).lower() == CURRENCY]
+        for o in items:
+            if o not in usd:
+                other_currency[o["currency"].upper()] += 1
+        return usd
+
+    def major(cents):
+        return (cents or 0) / 100  # USD only - other currencies are excluded above
+
+    charges = fetch(client.v1.charges, created)
+    bts = fetch(client.v1.balance_transactions, created)
+    payouts = fetch(client.v1.payouts, {"arrival_date": {"gte": start_ts, "lt": end_ts}})
+    disputes = fetch(client.v1.disputes, created)
+
+    stats = row["stats"]
+    for c in charges:
+        if c["status"] == "failed":
+            add_decline(breakdowns, nice_label((c.get("outcome") or {}).get("reason") or c.get("failure_code")))
+        elif c["status"] == "succeeded":
+            if c.get("refunded") and not c.get("captured"):  # released without capture
+                stats["released"] += 1
+                stats["released_amt"] += major(c["amount"])
+                continue
+            amt = major(c["amount"])
+            stats["auths"] += 1
+            stats["auths_amt"] += amt
+            pmd = c.get("payment_method_details") or {}
+            breakdowns["brands"][(pmd.get("card") or pmd.get("card_present") or {}).get("brand")] += 1
+            if c.get("captured"):
+                stats["captured"] += 1
+                stats["captured_amt"] += major(c.get("amount_captured"))
+            else:
+                stats["pending"] += 1
+                stats["pending_amt"] += amt
+
+    for b in bts:
+        if b["type"] in STRIPE_CHARGE_TYPES:
+            amt = major(b["amount"])
+            stats["captures"] += 1
+            stats["captures_amt"] += amt
+            breakdowns["website_volume"][row["website"]] += amt
+            breakdowns["volume"][row["merchant"]] += amt
+        elif b["type"] in STRIPE_REFUND_TYPES:
+            stats["refunds"] += 1
+            stats["refunds_amt"] += -major(b["amount"])
+
+    row["extras"] = {
+        "paid_out": sum(major(p["amount"]) for p in payouts if p["status"] == "paid"),
+        "fees": sum(major(b["fee"]) for b in bts if b["type"] not in STRIPE_PAYOUT_TYPES),
+        "disputes": len(disputes),
+        "disputed": sum(major(d["amount"]) for d in disputes),
+    }
+    return (f"{len(charges):,} charges, {len(bts):,} balance transactions, "
+            f"{len(payouts):,} payouts, {len(disputes):,} disputes")
+
+
+# ---------------------------------------------------------------------------
+# SlimCD (usr_processors rows with cc_gateway='D')
+# ---------------------------------------------------------------------------
+
+def slimcd_call(session, login, op, **params):
+    """POSTs one reports.asmx operation and returns its <reply> element."""
+    resp = None
+    try:
+        resp = session.post(SLIMCD_URL + op, timeout=180,
+                            data={"UserName": login["username"], "Password": login["password"], **params})
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except requests.RequestException as e:
+        raise GatewayError(type(e).__name__) from None
+    except ET.ParseError:
+        raise GatewayError(scrub("non-XML response: " + resp.text[:120], login)) from None
+    if root.findtext("response") != "Success":
+        raise GatewayError(scrub(root.findtext("description") or "unknown error", login)[:200])
+    return root
+
+
+def parse_slimcd(el):
+    def text(key):
+        return (el.findtext(key) or "").strip()
+
+    try:
+        when = datetime.strptime(text("transactiondate"), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=SLIMCD_TZ)
+    except ValueError:
+        when = None
+    try:
+        amount = float(text("amount") or 0)
+    except ValueError:
+        amount = 0.0
+    card = text("cardtype").upper()
+    return {
+        "gateid": text("gateid"), "when": when, "type": text("transtype").upper(), "approved": text("approved"),
+        "amount": amount, "brand": SLIMCD_BRANDS.get(card, card.lower() or None), "cardid": text("cardid"),
+        "siteid": text("siteid"), "voided": text("voided") not in ("", "0"), "proc_response": text("proc_response"),
+    }
+
+
+def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
+    """Fills one row from SlimCD. A capture (FORCE) is its own record, so it
+    counts on its own day like NMI's; an auth is captured when GetOpenAuths no
+    longer lists it, and its captured amount comes from the first later FORCE
+    on the same cardid. Records are fetched through today so captures and voids
+    made after the window are visible. Returns a short summary for the console."""
+    dates = {"StartDate": start_dt.astimezone(SLIMCD_TZ).strftime("%m/%d/%Y"),
+             "EndDate": datetime.now(SLIMCD_TZ).strftime("%m/%d/%Y")}  # EndDate is inclusive
+    root = slimcd_call(session, login, "SearchTransactions", RecordCountOnly="false",
+                       MaxRecords=SLIMCD_MAX_RECORDS, SearchXML="<search></search>", **dates)
+    recs = [parse_slimcd(el) for el in root.iter("Transaction")]
+    if len(recs) >= SLIMCD_MAX_RECORDS:
+        raise GatewayError(f"result truncated at {SLIMCD_MAX_RECORDS:,} records")
+    open_auths = set()
+    for site in sorted({r["siteid"] for r in recs if r["siteid"]}):
+        reply = slimcd_call(session, login, "GetOpenAuths", SiteID=site, **dates)
+        open_auths |= {(el.findtext("gateid") or "").strip() for el in reply.iter("Openauth")}
+
+    in_window = [r for r in recs if r["when"] is not None and start_dt <= r["when"] < end_dt]
+    forces = sorted((r for r in recs if r["type"] == "FORCE" and r["approved"] == "Y" and r["cardid"]),
+                    key=lambda r: r["when"] or start_dt)
+    used_forces = set()
+    unlinked = 0
+    stats = row["stats"]
+    for r in in_window:
+        kind, amt = r["type"], r["amount"]
+        if r["approved"] == "N":
+            if kind in ("AUTH", "SALE"):
+                add_decline(breakdowns, re.sub(r"\s+\d+$", "", r["proc_response"]))
+            continue
+        if r["approved"] != "Y":
+            continue
+        if kind == "AUTH":
+            if r["voided"]:  # released without capture; left out of the total, matching NMI and Stripe
+                stats["released"] += 1
+                stats["released_amt"] += amt
+                continue
+            stats["auths"] += 1
+            stats["auths_amt"] += amt
+            breakdowns["brands"][r["brand"]] += 1
+            if r["gateid"] in open_auths:
+                stats["pending"] += 1
+                stats["pending_amt"] += amt
+                continue
+            stats["captured"] += 1
+            force = next((f for f in forces if f["gateid"] not in used_forces and f["cardid"] == r["cardid"]
+                          and f["when"] and f["when"] >= r["when"]), None)
+            if force:
+                used_forces.add(force["gateid"])
+                stats["captured_amt"] += force["amount"]
+            else:
+                unlinked += 1
+        elif kind == "FORCE":
+            stats["captures"] += 1
+            stats["captures_amt"] += amt
+            stats["captures_voided"] += r["voided"]
+            breakdowns["website_volume"][row["website"]] += amt
+            breakdowns["volume"][row["merchant"]] += amt
+        elif kind == "SALE":
+            stats["sales"] += 1
+            stats["sales_amt"] += amt
+            stats["sales_voided"] += r["voided"]
+            breakdowns["website_volume"][row["website"]] += amt
+            breakdowns["volume"][row["merchant"]] += amt
+            breakdowns["brands"][r["brand"]] += 1
+        elif kind == "CREDIT":
+            stats["refunds"] += 1
+            stats["refunds_amt"] += abs(amt)
+
+    if unlinked:
+        notes.append(f"{unlinked:,} captured SlimCD auth(s) for {html.escape(row['merchant'])} had no matching "
+                     f"FORCE record, so their captured amount isn't included.")
+    if DEBUG:
+        print(f"    in window by type/approved: {dict(Counter((r['type'], r['approved']) for r in in_window))}"
+              f" | open auths: {len(open_auths):,}")
+    return f"{len(recs):,} records ({len(in_window):,} in window)"
 
 
 def collect(logins, start_dt, end_dt, breakdowns, notes):
@@ -337,6 +559,12 @@ def collect(logins, start_dt, end_dt, breakdowns, notes):
         rows = login["rows"]
         label = f"{rows[0]['merchant']} / {rows[0]['provider']} ({rows[0]['gateway_id']})"
         try:
+            if login["gateway"] == "stripe":
+                print(f"  {label}: {fetch_stripe(rows[0], start_dt, end_dt, breakdowns, other_currency)}")
+                continue
+            if login["gateway"] == "slimcd":
+                print(f"  {label}: {fetch_slimcd(session, login, rows[0], start_dt, end_dt, breakdowns, notes)}")
+                continue
             txs = fetch_transactions(session, login, start_dt, end_dt)
         except GatewayError as e:
             print(f"  {label}: UNAVAILABLE ({e})")
@@ -487,8 +715,9 @@ def stat_box(label, value, color="#4A90D9", detail=None):
 
 # Table columns: (heading, count key, amount key).
 COLUMNS = [
-    ("Auths", "auths", "auths_amt"), ("Captured", "captured", "captured_amt"), ("Pending", "pending", "pending_amt"),
-    ("Captures", "captures", "captures_amt"), ("Sales", "sales", "sales_amt"), ("Refunds", "refunds", "refunds_amt"),
+    ("Auths", "auths", "auths_amt"), ("Pending Auths", "pending", "pending_amt"),
+    ("Captures", "captures", "captures_amt"), ("Voids", "released", "released_amt"),
+    ("Refunds", "refunds", "refunds_amt"),
 ]
 
 
@@ -500,46 +729,53 @@ def add_stats(rows):
 
 
 def table_row(label, stats, indent=0, bg="#fff", weight=400):
-    td = f'padding:6px 5px;border-bottom:1px solid #eee;font-size:11px;font-weight:{weight};'
+    td = f'padding:6px 5px;border-bottom:1px solid #eee;font-size:12px;font-weight:{weight};'
     cells = [f'<td style="{td}padding-left:{5 + indent}px;">{label}</td>']
     for _, count, amount in COLUMNS:
         if stats[count]:
             cells.append(f'<td align="right" style="{td}">{fmt_money(stats[amount])}'
-                         f'<div style="font-size:9px;color:#999;font-weight:400;">{fmt_int(stats[count])}</div></td>')
+                         f'<div style="font-size:10px;color:#999;font-weight:400;">{fmt_int(stats[count])}</div></td>')
         else:
             cells.append(f'<td align="right" style="{td}color:#ccc;">&mdash;</td>')
     return f'<tr style="background:{bg};">' + "".join(cells) + "</tr>"
 
 
 def unavailable_row(label, indent):
-    td = 'padding:6px 5px;border-bottom:1px solid #eee;font-size:11px;'
+    td = 'padding:6px 5px;border-bottom:1px solid #eee;font-size:12px;'
     return (f'<tr style="background:#fff5f5;"><td style="{td}padding-left:{5 + indent}px;">{label}</td>'
             f'<td colspan="{len(COLUMNS)}" align="center" style="{td}color:#c0392b;font-weight:600;">Unavailable</td></tr>')
 
 
+def extras_row(extras, indent):
+    """Stripe-only figures under the Stripe provider row."""
+    text = (f"Stripe only: Paid out {fmt_money(extras['paid_out'])} &middot; Fees {fmt_money(extras['fees'])}"
+            f" &middot; Disputes {fmt_int(extras['disputes'])} ({fmt_money(extras['disputed'])})")
+    return (f'<tr><td colspan="{len(COLUMNS) + 1}" style="padding:0 5px 6px {5 + indent}px;'
+            f'border-bottom:1px solid #eee;font-size:11px;color:#888;">{text}</td></tr>')
+
+
 def build_table(logins):
-    """Website > merchant > provider, with subtotals on the website and merchant rows."""
-    tree = defaultdict(lambda: defaultdict(list))
+    """Total, then website > provider - merchant, with subtotals on the website rows."""
+    tree = defaultdict(list)
     for login in logins:
         for row in login["rows"]:
-            tree[row["website"]][row["merchant"]].append(row)
+            tree[row["website"]].append(row)
 
     head = "".join(f'<th align="right" style="padding:6px 5px;">{c[0]}</th>' for c in COLUMNS)
     parts = ['<table width="100%" cellpadding="0" cellspacing="0" border="0" '
              'style="border-collapse:collapse;margin-bottom:24px;color:#333;">',
-             '<tr style="background:#4B45C6;color:#fff;font-size:11px;">'
-             '<th align="left" style="padding:6px 5px;">Website / Merchant / Provider</th>' + head + '</tr>']
+             '<tr style="background:#4B45C6;color:#fff;font-size:12px;">'
+             '<th align="left" style="padding:6px 5px;">Website / Provider - Merchant</th>' + head + '</tr>',
+             table_row("Total", add_stats(r for rows in tree.values() for r in rows), bg="#D8D8F5", weight=700)]
     for website in sorted(tree):
-        merchants = tree[website]
-        parts.append(table_row(html.escape(website), add_stats(r for ms in merchants.values() for r in ms),
-                               bg="#E4E4FB", weight=700))
-        for merchant in sorted(merchants):
-            parts.append(table_row(html.escape(merchant), add_stats(merchants[merchant]), 10, "#F5F5FD", 600))
-            for row in sorted(merchants[merchant], key=lambda r: (r["provider"], r["gateway_id"])):
-                label = (html.escape(row["provider"]) + '<div style="font-size:9px;color:#999;">'
-                         + html.escape(row["gateway_id"]) + '</div>')
-                parts.append(unavailable_row(label, 20) if row["unavailable"]
-                             else table_row(label, row["stats"], 20))
+        parts.append(table_row(html.escape(website), add_stats(tree[website]), bg="#E4E4FB", weight=700))
+        for row in sorted(tree[website], key=lambda r: (r["provider"], r["merchant"], r["gateway_id"])):
+            label = (html.escape(f"{row['provider']} - {row['merchant']}") + '<div style="font-size:10px;color:#999;">'
+                     + html.escape(row["gateway_id"]) + '</div>')
+            parts.append(unavailable_row(label, 10) if row["unavailable"]
+                         else table_row(label, row["stats"], 10))
+            if row["extras"] and not row["unavailable"]:
+                parts.append(extras_row(row["extras"], 10))
     parts.append("</table>")
     return "\n".join(parts)
 
@@ -689,20 +925,17 @@ def parse_args():
 def build_cards(totals):
     """(label, value, detail) per summary card."""
     auth_detail = (f"{plural(totals['auths'], 'auth')} &bull; {fmt_int(totals['captured'])} captured "
-                   f"({fmt_money(totals['captured_amt'])}) &bull; {fmt_int(totals['pending'])} pending "
-                   f"({fmt_money(totals['pending_amt'])})")
-    if totals["released"]:
-        auth_detail += f" &bull; {fmt_int(totals['released'])} released"
+                   f"({fmt_money(totals['captured_amt'])})")
 
     def with_voids(detail, voided):
         return detail + (f" &bull; {fmt_int(voided)} since voided" if voided else "")
 
     return [
         ("Auths", fmt_money(totals["auths_amt"]), auth_detail),
+        ("Pending Auths", fmt_money(totals["pending_amt"]), plural(totals["pending"], "pending auth")),
         ("Captures", fmt_money(totals["captures_amt"]),
          with_voids(plural(totals["captures"], "capture"), totals["captures_voided"])),
-        ("Sales", fmt_money(totals["sales_amt"]),
-         with_voids(plural(totals["sales"], "sale"), totals["sales_voided"])),
+        ("Voids", fmt_money(totals["released_amt"]), plural(totals["released"], "released auth")),
         ("Refunds", fmt_money(totals["refunds_amt"]), plural(totals["refunds"], "refund")),
     ]
 
@@ -732,7 +965,8 @@ def main():
 
     print(f"Fetching NMI transactions ({days}-day window) ...")
     notes = []
-    breakdowns = {"website_volume": Counter(), "volume": Counter(), "brands": Counter(), "declines": Counter()}
+    breakdowns = {"website_volume": Counter(), "volume": Counter(), "brands": Counter(), "declines": Counter(),
+                  "decline_labels": {}}
     failed = collect(logins, start_dt, end_dt, breakdowns, notes)
     if len(failed) == len(logins):
         raise SystemExit("Every gateway login failed - not sending a report.")
@@ -742,12 +976,15 @@ def main():
         bar_spec("Volume by Website", breakdowns["website_volume"], "money", labeler=lambda k: k),
         bar_spec("Volume by Merchant", breakdowns["volume"], "money", labeler=lambda k: k),
         bar_spec("Card Brands", breakdowns["brands"]),
-        bar_spec("Decline Reasons", breakdowns["declines"], labeler=lambda k: k),
+        bar_spec("Decline Reasons", breakdowns["declines"], labeler=breakdowns["decline_labels"].get),
     ]
     pngs = {s["id"]: make_bar_chart(s) for s in specs if s["rows"]}
     email_images = {chart_cid(s): pngs[s["id"]][0] for s in specs if s["id"] in pngs}
 
     totals = add_stats(r for login in logins for r in login["rows"])
+    if totals["sales"]:  # no Sales column, so don't let any go unseen
+        notes.append(f"Not shown in the table: {plural(totals['sales'], 'sale')} totalling "
+                     f"{fmt_money(totals['sales_amt'])} (auth and capture in one step), included in the volume charts.")
     boxes = "".join(stat_box(label, value, PALETTE[i % len(PALETTE)], detail)
                     for i, (label, value, detail) in enumerate(build_cards(totals)))
 

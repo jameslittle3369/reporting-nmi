@@ -6,7 +6,9 @@ one HTML email via Amazon SES with combined summary cards, a table grouped by
 website, merchant and provider, and breakdown charts.
 
 Merchants and gateway logins are read from the `TELCAN` database at run time, so
-a new merchant is picked up without a config change.
+a new merchant is picked up without a config change. The Stripe account
+(`usr_processors` rows with `cc_gateway='S'`) and the SlimCD merchants
+(`cc_gateway='D'`) are merged into the same report.
 
 ---
 
@@ -32,12 +34,19 @@ py -3.14 -m venv .venv
 
 Requires **ODBC Driver 17 for SQL Server**.
 
-### 2. Configure AWS credentials (for SES)
+### 2. Stripe API key
+
+Set `STRIPE_API_KEY` in `.env` to a restricted key (`rk_live_...`) with **Read**
+access to Balance transactions, Charges, Disputes and Payouts. It's the same key
+as `Reporting\Stripe`. If it's blank or rejected, the Stripe row shows as
+Unavailable.
+
+### 3. Configure AWS credentials (for SES)
 
 Add your IAM credentials to `C:\Users\James\.aws\credentials`, or set
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` directly in `.env`.
 
-### 3. Configure `.env`
+### 4. Configure `.env`
 
 ```powershell
 copy .env.example .env
@@ -96,19 +105,58 @@ locally instead of sending.
 
 | Card | Source |
 |---|---|
-| Auths | Successful `auth` actions dated yesterday, excluding ones voided without capture. Detail line: count, captured (amount actually captured, including captures made since), pending capture, released |
+| Auths | Successful `auth` actions dated yesterday, excluding ones voided without capture. Detail line: count, captured (amount actually captured, including captures made since) |
+| Pending Auths | Yesterday's auths not yet captured |
 | Captures | Successful `capture` actions dated yesterday — everything captured yesterday, including auths from earlier days |
-| Sales | Successful `sale` actions dated yesterday. These auth and capture in one step and are **not** counted in Auths or Captures |
+| Voids | Yesterday's auths released or voided without capture, at their auth amount |
 | Refunds | Successful `refund` and `credit` actions dated yesterday |
 
-Captures and Sales include any that were later voided; the detail line shows how
-many.
+Captures include any that were later voided; the detail line shows how many.
 
-**Table:** website > merchant > provider, with subtotals on website and merchant
-rows. Providers are the `usr_processors` rows with `cc_gateway='N'`.
+**Table columns:** Auths | Pending Auths | Captures | Voids | Refunds.
+**Pending Auths** are the day's auths not yet captured, which is Auths minus the
+auth amount of those already captured. **Voids** are the day's auths released or
+voided without capture, at their auth amount. They are left out of Auths. For NMI
+that's an auth with a void, for Stripe a charge refunded while uncaptured, and
+for SlimCD a voided `AUTH`.
+
+**Sales** (`sale` actions, which auth and capture in one step) have no column or
+card. They're still counted in the volume charts, and if any occur a footnote
+gives their count and total.
+
+**Table:** a Total row, then website > provider - merchant, with subtotals on the
+website rows. Providers are the `usr_processors` rows with `cc_gateway='N'` (NMI) or
+`'S'` (Stripe).
+
+**Stripe row:** uses the same definitions as the Stripe report. Auths are the
+day's succeeded charges, excluding ones released without capture. Captures and
+refunds come from the day's balance transactions, so captures include auths from
+earlier days. A small **Stripe only** line under the row shows payouts paid,
+fees and disputes, which NMI has no equivalent for. The account uses manual
+capture only, so it has no sales.
+
+**SlimCD rows:** read from the reports web service
+(`stats.slimcd.com/wswebservices/reports.asmx`): `SearchTransactions` for
+records, `GetOpenAuths` for auths not yet captured. The `usr_processors` username
+must be the numeric **ClientID** with its client password. Record times are US
+Eastern.
+
+| Column | SlimCD source |
+|---|---|
+| Auths | Approved `AUTH` records in the window, excluding voided ones (see Voids) |
+| Pending Auths | Auths that `GetOpenAuths` still lists. The others count as captured on the Auths card. Their captured amount is the first later approved `FORCE` on the same `cardid`; if none is found, the auth is counted without an amount and a footnote says so |
+| Captures | Approved `FORCE` records in the window, including auths from earlier days |
+| Voids | Approved `AUTH` records in the window that were voided |
+| Refunds | Approved `CREDIT` records |
+
+Approved `SALE` records are handled like NMI sales (see the footnote above).
+
+Declined `AUTH`/`SALE` records feed Decline Reasons, with the trailing response
+code removed. `SMS` receipt records are ignored.
 
 **Charts:** Volume by Website and Volume by Merchant (captures plus sales),
-Card Brands, Decline Reasons. Empty ones are listed in a compact "No activity in this period" note.
+Card Brands, Decline Reasons. Decline reasons are grouped case-insensitively
+across NMI and Stripe. Empty ones are listed in a compact "No activity in this period" note.
 
 ---
 
@@ -133,8 +181,8 @@ Card Brands, Decline Reasons. Empty ones are listed in a compact "No activity in
   non-zero and sends nothing.
 - **Gateway hosts:** the database doesn't store a host. Use `NMI_URL_OVERRIDES`
   in `.env` for a merchant on a private-label host.
-- **Not available:** the Query API has no payouts, balances or processor fees,
-  so those Stripe report cards have no equivalent here.
+- **Not available for NMI:** the Query API has no payouts, balances or
+  processor fees, so those appear only on the Stripe-only line.
 - **Currency:** amounts are USD. Transactions in other currencies are excluded
   and counted in a footnote.
 - **Sensitive data:** gateway logins stay in memory only, and `--debug` prints an
