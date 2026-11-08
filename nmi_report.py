@@ -86,6 +86,10 @@ TO_ADDRESSES = [a.strip() for a in os.getenv("TO_ADDRESSES", "").split(",") if a
 REPORT_DAYS = int(os.getenv("REPORT_DAYS", "1"))
 TIMEZONE    = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
 
+# Summary bullets shown above the table - one per line, see the README.
+SUMMARY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.getenv("SUMMARY_FILE", "summary_bullets.txt"))
+
 DEBUG = False
 # -----------------------------------------------------------------------------
 
@@ -795,17 +799,6 @@ def inline_images_for_preview(html_body, images):
     return html_body
 
 
-def stat_box(label, value, color="#4A90D9", detail=None):
-    return (
-        '<div style="flex:1;min-width:140px;background:#fff;border-radius:8px;'
-        'padding:16px 12px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08);">'
-        '<div style="font-size:22px;font-weight:700;color:' + color + ';">' + str(value) + '</div>'
-        '<div style="font-size:11px;color:#666;margin-top:4px;">' + label + '</div>'
-        + ('<div style="font-size:10px;color:#999;margin-top:2px;">' + detail + '</div>' if detail else '')
-        + '</div>'
-    )
-
-
 # ---------------------------------------------------------------------------
 # Email body (light theme, CID-embedded PNG charts - see img_tag/send_email)
 # ---------------------------------------------------------------------------
@@ -894,7 +887,7 @@ def build_charts_html(specs, pngs):
     return "\n".join(parts)
 
 
-def build_email_html(report_date, days, boxes, table_html, charts_html, notes, failed):
+def build_email_html(report_date, days, summary_html, table_html, charts_html, notes, failed):
     ts_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %Z")
     notes_html = "".join(f'<p style="margin:16px 0 0;font-size:11px;color:#888;">{n}</p>' for n in notes)
     period = "Daily report" if days == 1 else f"{days} days"
@@ -921,9 +914,7 @@ def build_email_html(report_date, days, boxes, table_html, charts_html, notes, f
         '<!--[if gte mso 9]></v:textbox></v:rect><![endif]-->',
         '<div style="padding:24px 32px;">',
         warning,
-        '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">',
-        boxes,
-        "</div>",
+        summary_html,
         table_html,
         charts_html,
         notes_html,
@@ -1021,22 +1012,48 @@ def parse_args():
     return args
 
 
-def build_cards(totals):
-    """(label, value, detail) per summary card."""
-    auth_detail = (f"{plural(totals['auths'], 'auth')} &bull; {fmt_int(totals['captured'])} captured "
-                   f"({fmt_money(totals['captured_amt'])})")
+SUMMARY_COUNTS = ["auths", "captured", "pending", "released", "captures", "captures_voided",
+                  "sales", "sales_voided", "refunds", "disputes"]
+SUMMARY_AMOUNTS = ["auths_amt", "captured_amt", "pending_amt", "released_amt", "captures_amt",
+                   "sales_amt", "refunds_amt", "paid_out", "fees", "disputed"]
+DEFAULT_SUMMARY = [
+    "Auths: {auths_amt} ({auths}) - {captured} captured for {captured_amt}",
+    "Pending Auths: {pending_amt} ({pending})",
+    "Captures: {captures_amt} ({captures})",
+    "Voids: {released_amt} ({released} released auths)",
+    "Refunds: {refunds_amt} ({refunds})",
+]
 
-    def with_voids(detail, voided):
-        return detail + (f" &bull; {fmt_int(voided)} since voided" if voided else "")
 
-    return [
-        ("Auths", fmt_money(totals["auths_amt"]), auth_detail),
-        ("Pending Auths", fmt_money(totals["pending_amt"]), plural(totals["pending"], "pending auth")),
-        ("Captures", fmt_money(totals["captures_amt"]),
-         with_voids(plural(totals["captures"], "capture"), totals["captures_voided"])),
-        ("Voids", fmt_money(totals["released_amt"]), plural(totals["released"], "released auth")),
-        ("Refunds", fmt_money(totals["refunds_amt"]), plural(totals["refunds"], "refund")),
-    ]
+def build_summary(totals, extras, report_date):
+    """Bullets from SUMMARY_FILE (one per line, {placeholders} filled from the
+    totals). A missing file falls back to DEFAULT_SUMMARY, and a line with an
+    unknown placeholder is shown as written, so a typo never stops the report."""
+    try:
+        with open(SUMMARY_FILE, encoding="utf-8-sig") as f:  # -sig: Notepad may add a BOM
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    except FileNotFoundError:
+        print(f"{SUMMARY_FILE} not found - using the default summary bullets.")
+        lines = DEFAULT_SUMMARY
+
+    stats = totals + extras
+    values = {k: fmt_int(stats[k]) for k in SUMMARY_COUNTS}
+    values.update({k: fmt_money(stats[k]) for k in SUMMARY_AMOUNTS})
+    values["capture_rate"] = f"{stats['captured'] / stats['auths']:.1%}" if stats["auths"] else "n/a"
+    values["period"] = report_date
+
+    items = []
+    for line in lines:
+        try:
+            text = line.format_map(values)
+        except (KeyError, ValueError, IndexError) as e:
+            print(f"Summary line not filled in ({type(e).__name__}: {e}): {line}")
+            text = line
+        label, sep, rest = text.partition(": ")
+        items.append(f"<li><b>{html.escape(label)}:</b> {html.escape(rest)}</li>" if sep
+                     else f"<li>{html.escape(text)}</li>")
+    return ('<ul style="margin:0 0 24px;padding-left:20px;font-size:14px;line-height:1.6;color:#333;">'
+            + "".join(items) + "</ul>")
 
 
 def main():
@@ -1091,11 +1108,15 @@ def main():
     if totals["sales"]:  # no Sales column, so don't let any go unseen
         notes.append(f"Not shown in the table: {plural(totals['sales'], 'sale')} totalling "
                      f"{fmt_money(totals['sales_amt'])} (auth and capture in one step), included in the volume charts.")
-    boxes = "".join(stat_box(label, value, PALETTE[i % len(PALETTE)], detail)
-                    for i, (label, value, detail) in enumerate(build_cards(totals)))
+    extras = Counter()
+    for login in logins:
+        for row in login["rows"]:
+            if row["extras"] and not row["unavailable"]:
+                extras.update(row["extras"])
+    summary_html = build_summary(totals, extras, report_date)
 
     print("Composing email ...")
-    html_body = build_email_html(report_date, days, boxes, build_table(logins),
+    html_body = build_email_html(report_date, days, summary_html, build_table(logins),
                                  build_charts_html(specs, pngs), notes, failed)
     subject = "IMT NMI Report | " + report_date + (" (incomplete)" if failed else "")
     file_name = "IMT_NMI_" + (end_dt - timedelta(days=1)).strftime("%Y%m%d") + "_email.html"

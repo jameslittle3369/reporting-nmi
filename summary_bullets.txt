@@ -1,0 +1,13 @@
+# Summary bullets shown above the table in the report email.
+# One bullet per line. {name} is filled in from the period's totals; lines starting with # are ignored.
+# Text before the first ": " is shown in bold. Placeholders are listed in README.md.
+Transaction IDs from NMI, SlimCD, and Stripe are compared one to one to the system.
+Any discrepancy with extra/missing transactions in the gateways or the system are flagged for that provider below in red
+The Auths figures are total auths, Pending Auths are still not cancelled/captured.  
+In the 'Truth' reconciliation Melissa does daily NMI only shows Pending auths, causing a constant variance from the system totals.  SlimCD manually does show the total Auths.  Stripe is a cluster to manually reconcile. 
+To match the 'Truth' we have to run at the same time.  Customer Service has the ability for 48 hours to cancel/capture changing the Pending Auths amount.
+#Auths: {auths_amt} ({auths}) - {captured} captured for {captured_amt}
+#Pending Auths: {pending_amt} ({pending})
+#Captures: {captures_amt} ({captures})
+#Voids: {released_amt} ({released} released auths)
+#Refunds: {refunds_amt} ({refunds})

@@ -2,8 +2,8 @@
 
 Reports the previous day's **authorizations, captures, sales and refunds**, and
 which of the day's auths were captured, across every NMI merchant account. Sends
-one HTML email via Amazon SES with combined summary cards, a table grouped by
-website, merchant and provider, and breakdown charts.
+one HTML email via Amazon SES with summary bullets, a table grouped by website
+and provider - merchant, and breakdown charts.
 
 Merchants and gateway logins are read from the `TELCAN` database at run time, so
 a new merchant is picked up without a config change. The Stripe account
@@ -17,6 +17,7 @@ a new merchant is picked up without a config change. The Stripe account
 | File | Purpose |
 |---|---|
 | `nmi_report.py` | Main script — loads accounts, queries NMI, builds charts, sends email |
+| `summary_bullets.txt` | The summary bullets at the top of the email (see [Summary bullets](#summary-bullets)) |
 | `.env` | Configuration (database, recipients, lookback window) — not committed |
 | `.env.example` | Template for `.env` |
 | `requirements.txt` | Python dependencies (requests, pyodbc, boto3, matplotlib, ...) |
@@ -106,26 +107,43 @@ locally instead of sending.
 
 ## What's reported
 
-| Card | Source |
+| Column | Source |
 |---|---|
-| Auths | Successful `auth` actions dated yesterday, excluding ones voided without capture. Detail line: count, captured (amount actually captured, including captures made since) |
-| Pending Auths | Yesterday's auths not yet captured |
-| Captures | Successful `capture` actions dated yesterday — everything captured yesterday, including auths from earlier days |
-| Voids | Yesterday's auths released or voided without capture, at their auth amount |
+| Auths | Successful `auth` actions dated yesterday, excluding ones voided without capture |
+| Pending Auths | Yesterday's auths not yet captured: Auths minus the auth amount of those already captured |
+| Captures | Successful `capture` actions dated yesterday — everything captured yesterday, including auths from earlier days, and including any later voided |
+| Voids | Yesterday's auths released or voided without capture, at their auth amount (left out of Auths). NMI: an auth with a void; Stripe: a charge refunded while uncaptured; SlimCD: a voided `AUTH` |
 | Refunds | Successful `refund` and `credit` actions dated yesterday |
 
-Captures include any that were later voided; the detail line shows how many.
+**Sales** (`sale` actions, which auth and capture in one step) have no column.
+They're still counted in the volume charts, and if any occur a footnote gives
+their count and total.
 
-**Table columns:** Auths | Pending Auths | Captures | Voids | Refunds.
-**Pending Auths** are the day's auths not yet captured, which is Auths minus the
-auth amount of those already captured. **Voids** are the day's auths released or
-voided without capture, at their auth amount. They are left out of Auths. For NMI
-that's an auth with a void, for Stripe a charge refunded while uncaptured, and
-for SlimCD a voided `AUTH`.
+### Summary bullets
 
-**Sales** (`sale` actions, which auth and capture in one step) have no column or
-card. They're still counted in the volume charts, and if any occur a footnote
-gives their count and total.
+The bullets above the table come from `summary_bullets.txt`, so you can add,
+reword or reorder them without touching the script:
+
+- One bullet per line. Blank lines and lines starting with `#` are ignored.
+- Text before the first `: ` is shown in bold.
+- `{name}` is replaced with the period's total:
+
+| Placeholder | Value |
+|---|---|
+| `{auths}` `{auths_amt}` | Auths count / amount |
+| `{captured}` `{captured_amt}` | Auths since captured / the amount actually captured |
+| `{pending}` `{pending_amt}` | Pending Auths |
+| `{released}` `{released_amt}` | Voids |
+| `{captures}` `{captures_amt}` `{captures_voided}` | Captures, and how many were later voided |
+| `{sales}` `{sales_amt}` `{sales_voided}` | Sales |
+| `{refunds}` `{refunds_amt}` | Refunds |
+| `{capture_rate}` | captured ÷ auths, e.g. `99.6%` |
+| `{paid_out}` `{fees}` `{disputes}` `{disputed}` | Stripe-only payouts, fees, dispute count / amount |
+| `{period}` | the report date or range |
+
+If the file is missing, a built-in default list is used. A line with an unknown
+placeholder is shown as written, and the console names the placeholder. Set
+`SUMMARY_FILE` in `.env` to use a different file.
 
 **Table:** a Total row, then website > provider - merchant, with subtotals on the
 website rows. Providers are the `usr_processors` rows with `cc_gateway='N'` (NMI) or
@@ -147,7 +165,7 @@ Eastern.
 | Column | SlimCD source |
 |---|---|
 | Auths | Approved `AUTH` records in the window, excluding voided ones (see Voids) |
-| Pending Auths | Auths that `GetOpenAuths` still lists. The others count as captured on the Auths card. Their captured amount is the first later approved `FORCE` on the same `cardid`; if none is found, the auth is counted without an amount and a footnote says so |
+| Pending Auths | Auths that `GetOpenAuths` still lists. The others count as captured (`{captured}` in the summary bullets). Their captured amount is the first later approved `FORCE` on the same `cardid`; if none is found, the auth is counted without an amount and a footnote says so |
 | Captures | Approved `FORCE` records in the window, including auths from earlier days |
 | Voids | Approved `AUTH` records in the window that were voided |
 | Refunds | Approved `CREDIT` records |
