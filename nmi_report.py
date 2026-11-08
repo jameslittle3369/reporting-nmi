@@ -26,6 +26,7 @@ Usage:
   python nmi_report.py --range 2026-10-01 2026-10-28    # inclusive date range
   python nmi_report.py --to a@b.com     # override recipients for this run
   python nmi_report.py --debug          # print a redacted sample per login
+  python nmi_report.py --no-save        # don't write IDs to gateway_transactions
 """
 
 import argparse
@@ -39,6 +40,7 @@ import struct
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 import email.mime.image
 import email.mime.multipart
@@ -96,7 +98,7 @@ ses = boto3.client("sesv2", **ses_kwargs)
 CURRENCY = "usd"
 RESULT_LIMIT = 1000
 ACCOUNTS_SQL = """
-    select p.agentid, m.FirstName merchant, p.site_agentid, s.FirstName website,
+    select p.id row_id, p.agentid, m.FirstName merchant, p.site_agentid, s.FirstName website,
            p.company_name, p.gateway_id, p.cc_gateway, p.cc_gateway_username, p.cc_gateway_password
     from usr_processors p with (nolock)
     left join usr_agents m with (nolock) on p.agentid = m.AgentId
@@ -152,15 +154,19 @@ def plural(n, word) -> str:
 # Merchant accounts (TELCAN database)
 # ---------------------------------------------------------------------------
 
-def load_logins():
-    """One entry per distinct gateway login, each with its usr_processors rows.
-    Rows can share a login, so querying per row would double-count that
-    login's transactions. Stripe rows ('S') share the one STRIPE_API_KEY."""
+def db_connect():
     if DB_TRUSTED_CONNECTION:
         auth = "Trusted_Connection=yes"
     else:
         auth = f"UID={DB_USERNAME};PWD={DB_PASSWORD}"
-    conn = pyodbc.connect(f"DRIVER={DB_DRIVER};SERVER={DB_SERVER};DATABASE={DB_DATABASE};{auth}", timeout=15)
+    return pyodbc.connect(f"DRIVER={DB_DRIVER};SERVER={DB_SERVER};DATABASE={DB_DATABASE};{auth}", timeout=15)
+
+
+def load_logins():
+    """One entry per distinct gateway login, each with its usr_processors rows.
+    Rows can share a login, so querying per row would double-count that
+    login's transactions. Stripe rows ('S') share the one STRIPE_API_KEY."""
+    conn = db_connect()
     try:
         rows = conn.cursor().execute(ACCOUNTS_SQL).fetchall()
     finally:
@@ -177,6 +183,7 @@ def load_logins():
             "url": NMI_URL_OVERRIDES.get(agentid, NMI_QUERY_URL), "rows": [],
         })
         login["rows"].append({
+            "row_id": str(r.row_id or "").strip(), "agentid": agentid, "site_agentid": site_agentid,
             "website": (r.website or site_agentid or "Unknown").strip(),
             "merchant": (r.merchant or agentid or "Unknown").strip(),
             "provider": (r.company_name or "Unknown").strip(),
@@ -184,6 +191,7 @@ def load_logins():
             "stats": Counter(),
             "extras": None,  # Stripe-only payouts / fees / disputes
             "unavailable": False,
+            "txns": [],  # gateway IDs saved to TXN_TABLE for backend reconciliation
         })
     return list(logins.values())
 
@@ -313,6 +321,7 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
             if voided:  # released without capture; left out of the total, matching the Stripe report
                 stats["released"] += 1
                 stats["released_amt"] += amt
+                record(row, "void", tx["id"], amt, a["when"])
                 continue
             stats["auths"] += 1
             stats["auths_amt"] += amt
@@ -323,12 +332,14 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
             else:
                 stats["pending"] += 1
                 stats["pending_amt"] += amt
+            record(row, "auth", tx["id"], amt, a["when"], "captured" if captures else "pending")
         elif kind == "capture":
             stats["captures"] += 1
             stats["captures_amt"] += amt
             stats["captures_voided"] += voided
             breakdowns["website_volume"][row["website"]] += amt
             breakdowns["volume"][row["merchant"]] += amt
+            record(row, "capture", tx["id"], amt, a["when"])
         elif kind == "sale":
             stats["sales"] += 1
             stats["sales_amt"] += amt
@@ -336,13 +347,20 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
             breakdowns["website_volume"][row["website"]] += amt
             breakdowns["volume"][row["merchant"]] += amt
             breakdowns["brands"][tx["cc_type"] or None] += 1
+            record(row, "sale", tx["id"], amt, a["when"])
         elif kind in ("refund", "credit"):
             stats["refunds"] += 1
             stats["refunds_amt"] += abs(amt)
+            record(row, "refund", tx["id"], abs(amt), a["when"])
 
     for a in tx["actions"]:
         if not a["success"] and a["type"] in ("auth", "sale") and in_window(a):
             add_decline(breakdowns, re.sub(r"\s*REFID:\S+", "", a["response_text"]).strip())
+
+
+def record(row, kind, txn_id, amount, when, status=None):
+    """Keeps a counted transaction's gateway ID for save_transactions()."""
+    row["txns"].append((kind, txn_id or "", amount, when, status))
 
 
 def add_decline(breakdowns, reason):
@@ -383,8 +401,19 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
     def major(cents):
         return (cents or 0) / 100  # USD only - other currencies are excluded above
 
+    def stamp(ts):
+        return datetime.fromtimestamp(ts, timezone.utc)
+
+    def intent_id(obj):  # the backend stores the PaymentIntent (pi_...) as RequestID
+        pi = obj.get("payment_intent")
+        return (pi.get("id") if isinstance(pi, dict) else pi) or obj["id"]
+
+    def source_id(b):  # PaymentIntent of the charge or refund behind a balance transaction
+        src = b.get("source")
+        return intent_id(src) if isinstance(src, dict) else (src or b["id"])
+
     charges = fetch(client.v1.charges, created)
-    bts = fetch(client.v1.balance_transactions, created)
+    bts = fetch(client.v1.balance_transactions, {**created, "expand": ["data.source"]})
     payouts = fetch(client.v1.payouts, {"arrival_date": {"gte": start_ts, "lt": end_ts}})
     disputes = fetch(client.v1.disputes, created)
 
@@ -396,6 +425,7 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             if c.get("refunded") and not c.get("captured"):  # released without capture
                 stats["released"] += 1
                 stats["released_amt"] += major(c["amount"])
+                record(row, "void", intent_id(c), major(c["amount"]), stamp(c["created"]))
                 continue
             amt = major(c["amount"])
             stats["auths"] += 1
@@ -408,6 +438,7 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             else:
                 stats["pending"] += 1
                 stats["pending_amt"] += amt
+            record(row, "auth", intent_id(c), amt, stamp(c["created"]), "captured" if c.get("captured") else "pending")
 
     for b in bts:
         if b["type"] in STRIPE_CHARGE_TYPES:
@@ -416,9 +447,11 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             stats["captures_amt"] += amt
             breakdowns["website_volume"][row["website"]] += amt
             breakdowns["volume"][row["merchant"]] += amt
+            record(row, "capture", source_id(b), amt, stamp(b["created"]))
         elif b["type"] in STRIPE_REFUND_TYPES:
             stats["refunds"] += 1
             stats["refunds_amt"] += -major(b["amount"])
+            record(row, "refund", source_id(b), -major(b["amount"]), stamp(b["created"]))
 
     row["extras"] = {
         "paid_out": sum(major(p["amount"]) for p in payouts if p["status"] == "paid"),
@@ -507,6 +540,7 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             if r["voided"]:  # released without capture; left out of the total, matching NMI and Stripe
                 stats["released"] += 1
                 stats["released_amt"] += amt
+                record(row, "void", r["gateid"], amt, r["when"])
                 continue
             stats["auths"] += 1
             stats["auths_amt"] += amt
@@ -514,8 +548,10 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             if r["gateid"] in open_auths:
                 stats["pending"] += 1
                 stats["pending_amt"] += amt
+                record(row, "auth", r["gateid"], amt, r["when"], "pending")
                 continue
             stats["captured"] += 1
+            record(row, "auth", r["gateid"], amt, r["when"], "captured")
             force = next((f for f in forces if f["gateid"] not in used_forces and f["cardid"] == r["cardid"]
                           and f["when"] and f["when"] >= r["when"]), None)
             if force:
@@ -529,6 +565,7 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             stats["captures_voided"] += r["voided"]
             breakdowns["website_volume"][row["website"]] += amt
             breakdowns["volume"][row["merchant"]] += amt
+            record(row, "capture", r["gateid"], amt, r["when"])
         elif kind == "SALE":
             stats["sales"] += 1
             stats["sales_amt"] += amt
@@ -536,9 +573,11 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             breakdowns["website_volume"][row["website"]] += amt
             breakdowns["volume"][row["merchant"]] += amt
             breakdowns["brands"][r["brand"]] += 1
+            record(row, "sale", r["gateid"], amt, r["when"])
         elif kind == "CREDIT":
             stats["refunds"] += 1
             stats["refunds_amt"] += abs(amt)
+            record(row, "refund", r["gateid"], abs(amt), r["when"])
 
     if unlinked:
         notes.append(f"{unlinked:,} captured SlimCD auth(s) for {html.escape(row['merchant'])} had no matching "
@@ -599,6 +638,64 @@ def collect(logins, start_dt, end_dt, breakdowns, notes):
         notes.append(f"{n:,} transaction(s) with processor_id {html.escape(pid)} matched no usr_processors row "
                      f"and were counted under {html.escape(label)}.")
     return failed
+
+
+# ---------------------------------------------------------------------------
+# Transaction IDs for backend reconciliation
+# ---------------------------------------------------------------------------
+
+TXN_TABLE = "gateway_transactions"
+TXN_TABLE_SQL = f"""
+if object_id('{TXN_TABLE}') is null
+begin
+    create table {TXN_TABLE} (
+        id int identity primary key,
+        gateway varchar(10) not null,
+        processor_row_id varchar(50) not null,
+        agentid varchar(50) null,
+        site_agentid varchar(50) null,
+        gateway_login varchar(50) null,
+        txn_type varchar(10) not null,
+        transaction_id varchar(64) not null,
+        auth_status varchar(10) null,
+        amount decimal(12, 2) not null,
+        txn_time datetime not null,
+        loaded_at datetime not null default getdate()
+    );
+    create index ix_{TXN_TABLE}_type_id on {TXN_TABLE} (txn_type, transaction_id);
+    create index ix_{TXN_TABLE}_row_time on {TXN_TABLE} (processor_row_id, txn_time);
+end
+"""
+
+
+def save_transactions(logins, start_dt, end_dt):
+    """Replaces the window's rows for every login that was read, in one DB
+    transaction, so re-running a day corrects auths captured or voided since
+    instead of duplicating them. Unavailable logins keep their earlier rows.
+    Times are stored in TIMEZONE. Returns the number of rows written."""
+    def local(dt):
+        return dt.astimezone(TIMEZONE).replace(tzinfo=None)
+
+    window = (local(start_dt), local(end_dt))
+    rows = [(login["gateway"], row) for login in logins for row in login["rows"] if not row["unavailable"]]
+    values = [(gateway, row["row_id"], row["agentid"], row["site_agentid"], row["gateway_id"],
+               kind, txn_id, status, Decimal(f"{amount:.2f}"), local(when))
+              for gateway, row in rows for kind, txn_id, amount, when, status in row["txns"]]
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(TXN_TABLE_SQL)
+        cur.executemany(f"delete from {TXN_TABLE} where processor_row_id = ? and txn_time >= ? and txn_time < ?",
+                        [(row["row_id"], *window) for _, row in rows])
+        if values:
+            cur.fast_executemany = True
+            cur.executemany(f"insert into {TXN_TABLE} (gateway, processor_row_id, agentid, site_agentid, "
+                            "gateway_login, txn_type, transaction_id, auth_status, amount, txn_time) "
+                            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(values)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +993,8 @@ def parse_args():
     p.add_argument("--preview", action="store_true", help="Save the report locally instead of emailing")
     p.add_argument("--to", nargs="+", default=None, help="Override recipients for this run")
     p.add_argument("--debug", action="store_true", help="Print a redacted sample transaction per gateway login")
+    p.add_argument("--no-save", action="store_true",
+                   help="Don't write transaction IDs to the gateway_transactions table")
     args = p.parse_args()
 
     def midnight(s):
@@ -970,6 +1069,13 @@ def main():
     failed = collect(logins, start_dt, end_dt, breakdowns, notes)
     if len(failed) == len(logins):
         raise SystemExit("Every gateway login failed - not sending a report.")
+
+    if not args.no_save:
+        try:
+            print(f"Saved {save_transactions(logins, start_dt, end_dt):,} transaction IDs to {TXN_TABLE}")
+        except pyodbc.Error as e:
+            print(f"Could not save transaction IDs to {TXN_TABLE}: {e.args[-1]}")
+            notes.append(f"Transaction IDs could not be saved to {TXN_TABLE} for reconciliation.")
 
     print("Building charts ...")
     specs = [

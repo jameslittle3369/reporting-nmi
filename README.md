@@ -82,6 +82,9 @@ Useful flags:
 
 # Override recipients for this run
 .venv\Scripts\python.exe nmi_report.py --to ops@example.com ceo@example.com
+
+# Don't write transaction IDs to gateway_transactions
+.venv\Scripts\python.exe nmi_report.py --preview --no-save
 ```
 
 If `FROM_ADDRESS` or `TO_ADDRESSES` are blank, the script saves the email body
@@ -157,6 +160,55 @@ code removed. `SMS` receipt records are ignored.
 **Charts:** Volume by Website and Volume by Merchant (captures plus sales),
 Card Brands, Decline Reasons. Decline reasons are grouped case-insensitively
 across NMI and Stripe. Empty ones are listed in a compact "No activity in this period" note.
+
+---
+
+## Transaction IDs for reconciliation
+
+Every run, including `--preview`, saves one row per counted transaction to the
+`gateway_transactions` table in `DB_SERVER`/`DB_DATABASE`. The script creates
+the table on first run, which needs CREATE TABLE permission. Use `--no-save` to
+skip saving.
+
+The rows match the report's columns, so `count(*)`/`sum(amount)` per type for a
+day equal the email's Total row:
+
+| txn_type | Rows |
+|---|---|
+| `auth` | Auths. `auth_status` is `captured` or `pending` |
+| `void` | Voids (auths released without capture), at the auth's time |
+| `capture` | Captures |
+| `refund` | Refunds |
+| `sale` | Sales (footnote only) |
+
+| Column | Value |
+|---|---|
+| gateway | `nmi`, `stripe` or `slimcd` |
+| processor_row_id, agentid, site_agentid, gateway_login | the `usr_processors` row the transaction was counted under |
+| transaction_id | the gateway's ID, as the backend stores it in `RequestID`: NMI `transaction_id`, SlimCD `gateid`, Stripe PaymentIntent `pi_...` |
+| amount | the amount the report counts (auth amount for `auth`/`void`) |
+| txn_time | when the action happened, in `TIMEZONE` |
+| loaded_at | when the run wrote the row |
+
+- **One ID, several rows:** NMI's auth and capture are actions on one
+  transaction, so a captured NMI auth has an `auth` row and a `capture` row with
+  the same ID. The same goes for Stripe's PaymentIntent. SlimCD gives each
+  record its own `gateid`.
+- **Re-runs:** re-running a day replaces that day's rows for every login that
+  was read, so auths captured or voided since then are updated rather than
+  duplicated. An Unavailable login keeps its earlier rows.
+
+Example check for gateway auths with no matching backend record (swap in the
+backend table you reconcile against):
+
+```sql
+select g.*
+from gateway_transactions g
+where g.txn_type = 'auth'
+  and g.txn_time >= '2026-11-02' and g.txn_time < '2026-11-03'
+  and not exists (select 1 from Log_ApprovedPhoneCardCustomers b
+                  where b.RequestID = g.transaction_id)
+```
 
 ---
 
