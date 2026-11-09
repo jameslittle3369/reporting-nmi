@@ -158,8 +158,10 @@ capture only, so it has no sales.
 
 **SlimCD rows:** read from the reports web service
 (`stats.slimcd.com/wswebservices/reports.asmx`): `SearchTransactions` for
-records, `GetOpenAuths` for auths not yet captured. The `usr_processors` username
-must be the numeric **ClientID** with its client password. Record times are US
+records, `GetOpenAuths` for auths not yet captured. The API needs the numeric **ClientID** with its client password. If a
+`usr_processors` username is a login name instead, map it with
+`SLIMCD_CLIENT_IDS` (e.g. `GT-Calls.com:29117`). Records are fetched from 3 days
+before the period, so a capture can be linked to an earlier auth. Record times are US
 Eastern.
 
 | Column | SlimCD source |
@@ -204,6 +206,7 @@ day equal the email's Total row:
 | gateway | `nmi`, `stripe` or `slimcd` |
 | processor_row_id, agentid, site_agentid, gateway_login | the `usr_processors` row the transaction was counted under |
 | transaction_id | the gateway's ID, as the backend stores it in `RequestID`: NMI `transaction_id`, SlimCD `gateid`, Stripe PaymentIntent `pi_...` |
+| related_id | SlimCD captures only: the `gateid` of the AUTH the FORCE was linked to |
 | amount | the amount the report counts (auth amount for `auth`/`void`) |
 | txn_time | when the action happened, in `TIMEZONE` |
 | loaded_at | when the run wrote the row |
@@ -227,6 +230,63 @@ where g.txn_type = 'auth'
   and not exists (select 1 from Log_ApprovedPhoneCardCustomers b
                   where b.RequestID = g.transaction_id)
 ```
+
+---
+
+## Reconciliation
+
+After saving `gateway_transactions`, the report compares the period's gateway
+IDs one to one with the system's tables, in both directions:
+
+| Comparison | Gateway side | System side |
+|---|---|---|
+| Auths | `auth` and `void` rows (a released auth was still an auth in the system) | `RECON_AUTHS_TABLE` |
+| Payments | `capture` rows | `RECON_PAYMENTS_TABLE` |
+
+Set each table and its columns in `.env`. A blank table skips that comparison.
+
+| Setting | Default |
+|---|---|
+| `RECON_<AUTHS/PAYMENTS>_TABLE` | blank (off) |
+| `RECON_<…>_ID_COLUMN` | `requestid`: the gateway transaction ID |
+| `RECON_<…>_LOGIN_COLUMN` | `cc_gateway_username`: matched to `usr_processors.cc_gateway_username` |
+| `RECON_<…>_DATE_COLUMN` | `CreatedDate` (auths) / `PaymentDate` (payments) |
+
+A provider row with any discrepancy is shaded red, with a red line under it
+listing up to 15 IDs per item. The console lists every ID, and a footnote gives
+the total. The discrepancy types are:
+
+- **in gateway, not in system:** the gateway has it, the system doesn't.
+- **in system, not in gateway:** the system has it, the gateway doesn't.
+- **recorded in system under another login:** the ID matches, but the system
+  logged it under a different `cc_gateway_username` than the provider's.
+
+How matching works:
+- **Midnight:** each side is checked against the other a day either way, so a
+  transaction logged at 23:59 on one side and 00:01 on the other isn't
+  flagged. Days you haven't run can still show near-midnight differences.
+- **Matching rules by gateway:**
+  - NMI and Stripe captures share the auth's ID.
+  - SlimCD captures (FORCE) have their own `gateid`. They match on either the
+    FORCE `gateid` or its linked AUTH (`related_id`), since the system stores
+    either.
+- **Attribution:**
+  - System-only IDs go to the provider row whose login matches.
+  - A shared login goes to its first row.
+  - IDs under a login no row has get a footnote.
+  - Rows whose gateway login was Unavailable aren't reconciled, with a footnote.
+- **SlimCD ClientID:** SlimCD's reports API needs the numeric ClientID, so
+  `SLIMCD_CLIENT_IDS=GT-Calls.com:29117` queries the `GT-Calls.com` row as
+  `29117`. Reconciliation treats each pair as one login.
+- **Date columns:** a real date/datetime column (as in production) is
+  filtered as-is, so an index on it is used. A varchar date column is
+  converted from text first, which is slower on big tables.
+- **Messy imports:** double quotes are stripped from IDs, logins and text
+  dates, so CSV imports like the dev `del_20261107_payments` work. Its column names include the quotes, so in
+  `.env` they're written as `'"PaymentDate"'` (single quotes keep the double
+  quotes).
+- **Errors:** a bad table or column name gives a console error and a
+  "Reconciliation could not run" footnote, and the email still goes out.
 
 ---
 

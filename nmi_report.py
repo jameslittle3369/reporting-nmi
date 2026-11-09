@@ -75,6 +75,22 @@ NMI_URL_OVERRIDES = dict(p.strip().split(":", 1) for p in os.getenv("NMI_URL_OVE
 # Used for usr_processors rows with cc_gateway='S'.
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
 
+# Comma-separated cc_gateway_username:ClientID pairs, for SlimCD rows whose login
+# isn't the numeric ClientID the reports API needs. Reconciliation treats each
+# pair as one login.
+SLIMCD_CLIENT_IDS = dict(p.strip().split(":", 1) for p in os.getenv("SLIMCD_CLIENT_IDS", "").split(",") if p.strip())
+
+# Backend tables to reconcile gateway_transactions against. A blank table skips it.
+RECON = {
+    kind: {
+        "table": os.getenv(f"RECON_{kind.upper()}_TABLE", ""),
+        "id": os.getenv(f"RECON_{kind.upper()}_ID_COLUMN", "requestid"),
+        "login": os.getenv(f"RECON_{kind.upper()}_LOGIN_COLUMN", "cc_gateway_username"),
+        "date": os.getenv(f"RECON_{kind.upper()}_DATE_COLUMN", date_col),
+    }
+    for kind, date_col in (("auths", "CreatedDate"), ("payments", "PaymentDate"))
+}
+
 AWS_REGION            = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -114,6 +130,7 @@ ACCOUNTS_SQL = """
 SLIMCD_URL = "https://stats.slimcd.com/wswebservices/reports.asmx/"
 SLIMCD_TZ = ZoneInfo("America/New_York")
 SLIMCD_MAX_RECORDS = 50000
+SLIMCD_LOOKBACK_DAYS = 3  # customer service can capture an auth for up to 48 hours
 SLIMCD_BRANDS = {"V": "visa", "M": "mastercard", "A": "amex", "D": "discover"}
 # Stripe balance transaction types (see Reporting\Stripe\stripe_report.py).
 STRIPE_PAYOUT_TYPES = {"payout", "payout_cancel", "payout_failure", "payout_minimum_balance_hold",
@@ -181,13 +198,17 @@ def load_logins():
         agentid, site_agentid = (r.agentid or "").strip(), (r.site_agentid or "").strip()
         gateway = {"S": "stripe", "D": "slimcd"}.get(r.cc_gateway, "nmi")
         key = (gateway,) if gateway == "stripe" else (gateway, r.cc_gateway_username, r.cc_gateway_password)
+        username = (r.cc_gateway_username or "").strip()
+        if gateway == "slimcd":
+            username = SLIMCD_CLIENT_IDS.get(username, username)
         login = logins.setdefault(key, {
             "gateway": gateway,
-            "username": r.cc_gateway_username or "", "password": r.cc_gateway_password or "",
+            "username": username, "password": r.cc_gateway_password or "",
             "url": NMI_URL_OVERRIDES.get(agentid, NMI_QUERY_URL), "rows": [],
         })
         login["rows"].append({
             "row_id": str(r.row_id or "").strip(), "agentid": agentid, "site_agentid": site_agentid,
+            "login": (r.cc_gateway_username or "").strip(),  # as usr_processors has it, for reconcile()
             "website": (r.website or site_agentid or "Unknown").strip(),
             "merchant": (r.merchant or agentid or "Unknown").strip(),
             "provider": (r.company_name or "Unknown").strip(),
@@ -196,6 +217,7 @@ def load_logins():
             "extras": None,  # Stripe-only payouts / fees / disputes
             "unavailable": False,
             "txns": [],  # gateway IDs saved to TXN_TABLE for backend reconciliation
+            "recon": [],  # (kind, direction, ids) discrepancies from reconcile()
         })
     return list(logins.values())
 
@@ -362,9 +384,10 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
             add_decline(breakdowns, re.sub(r"\s*REFID:\S+", "", a["response_text"]).strip())
 
 
-def record(row, kind, txn_id, amount, when, status=None):
-    """Keeps a counted transaction's gateway ID for save_transactions()."""
-    row["txns"].append((kind, txn_id or "", amount, when, status))
+def record(row, kind, txn_id, amount, when, status=None, related_id=None):
+    """Keeps a counted transaction's gateway ID for save_transactions() and
+    reconcile(). related_id is the auth a SlimCD capture (FORCE) belongs to."""
+    row["txns"].append((kind, txn_id or "", amount, when, status, related_id))
 
 
 def add_decline(breakdowns, reason):
@@ -513,8 +536,9 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
     counts on its own day like NMI's; an auth is captured when GetOpenAuths no
     longer lists it, and its captured amount comes from the first later FORCE
     on the same cardid. Records are fetched through today so captures and voids
-    made after the window are visible. Returns a short summary for the console."""
-    dates = {"StartDate": start_dt.astimezone(SLIMCD_TZ).strftime("%m/%d/%Y"),
+    made after the window are visible, and from SLIMCD_LOOKBACK_DAYS before it so
+    a capture can be linked to its auth. Returns a short summary for the console."""
+    dates = {"StartDate": (start_dt - timedelta(days=SLIMCD_LOOKBACK_DAYS)).astimezone(SLIMCD_TZ).strftime("%m/%d/%Y"),
              "EndDate": datetime.now(SLIMCD_TZ).strftime("%m/%d/%Y")}  # EndDate is inclusive
     root = slimcd_call(session, login, "SearchTransactions", RecordCountOnly="false",
                        MaxRecords=SLIMCD_MAX_RECORDS, SearchXML="<search></search>", **dates)
@@ -527,9 +551,19 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
         open_auths |= {(el.findtext("gateid") or "").strip() for el in reply.iter("Openauth")}
 
     in_window = [r for r in recs if r["when"] is not None and start_dt <= r["when"] < end_dt]
+    # Link each captured auth to the first later unused FORCE on the same card. The
+    # lookback before the window lets a window capture link to an earlier day's auth.
     forces = sorted((r for r in recs if r["type"] == "FORCE" and r["approved"] == "Y" and r["cardid"]),
                     key=lambda r: r["when"] or start_dt)
-    used_forces = set()
+    captured_auths = sorted((r for r in recs if r["type"] == "AUTH" and r["approved"] == "Y" and r["when"]
+                             and not r["voided"] and r["gateid"] not in open_auths), key=lambda r: r["when"])
+    force_of, auth_of = {}, {}
+    for a in captured_auths:
+        force = next((f for f in forces if f["gateid"] not in auth_of and f["cardid"] == a["cardid"]
+                      and f["when"] and f["when"] >= a["when"]), None)
+        if force:
+            force_of[a["gateid"]] = force
+            auth_of[force["gateid"]] = a["gateid"]
     unlinked = 0
     stats = row["stats"]
     for r in in_window:
@@ -556,10 +590,8 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
                 continue
             stats["captured"] += 1
             record(row, "auth", r["gateid"], amt, r["when"], "captured")
-            force = next((f for f in forces if f["gateid"] not in used_forces and f["cardid"] == r["cardid"]
-                          and f["when"] and f["when"] >= r["when"]), None)
+            force = force_of.get(r["gateid"])
             if force:
-                used_forces.add(force["gateid"])
                 stats["captured_amt"] += force["amount"]
             else:
                 unlinked += 1
@@ -569,7 +601,7 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             stats["captures_voided"] += r["voided"]
             breakdowns["website_volume"][row["website"]] += amt
             breakdowns["volume"][row["merchant"]] += amt
-            record(row, "capture", r["gateid"], amt, r["when"])
+            record(row, "capture", r["gateid"], amt, r["when"], related_id=auth_of.get(r["gateid"]))
         elif kind == "SALE":
             stats["sales"] += 1
             stats["sales_amt"] += amt
@@ -661,6 +693,7 @@ begin
         gateway_login varchar(50) null,
         txn_type varchar(10) not null,
         transaction_id varchar(64) not null,
+        related_id varchar(64) null,
         auth_status varchar(10) null,
         amount decimal(12, 2) not null,
         txn_time datetime not null,
@@ -669,6 +702,8 @@ begin
     create index ix_{TXN_TABLE}_type_id on {TXN_TABLE} (txn_type, transaction_id);
     create index ix_{TXN_TABLE}_row_time on {TXN_TABLE} (processor_row_id, txn_time);
 end
+if col_length('{TXN_TABLE}', 'related_id') is null
+    alter table {TXN_TABLE} add related_id varchar(64) null;
 """
 
 
@@ -677,14 +712,11 @@ def save_transactions(logins, start_dt, end_dt):
     transaction, so re-running a day corrects auths captured or voided since
     instead of duplicating them. Unavailable logins keep their earlier rows.
     Times are stored in TIMEZONE. Returns the number of rows written."""
-    def local(dt):
-        return dt.astimezone(TIMEZONE).replace(tzinfo=None)
-
     window = (local(start_dt), local(end_dt))
     rows = [(login["gateway"], row) for login in logins for row in login["rows"] if not row["unavailable"]]
     values = [(gateway, row["row_id"], row["agentid"], row["site_agentid"], row["gateway_id"],
-               kind, txn_id, status, Decimal(f"{amount:.2f}"), local(when))
-              for gateway, row in rows for kind, txn_id, amount, when, status in row["txns"]]
+               kind, txn_id, related_id, status, Decimal(f"{amount:.2f}"), local(when))
+              for gateway, row in rows for kind, txn_id, amount, when, status, related_id in row["txns"]]
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -694,12 +726,136 @@ def save_transactions(logins, start_dt, end_dt):
         if values:
             cur.fast_executemany = True
             cur.executemany(f"insert into {TXN_TABLE} (gateway, processor_row_id, agentid, site_agentid, "
-                            "gateway_login, txn_type, transaction_id, auth_status, amount, txn_time) "
-                            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+                            "gateway_login, txn_type, transaction_id, related_id, auth_status, amount, txn_time) "
+                            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
         conn.commit()
     finally:
         conn.close()
     return len(values)
+
+
+def local(dt):
+    """Naive TIMEZONE time, as stored in TXN_TABLE."""
+    return dt.astimezone(TIMEZONE).replace(tzinfo=None)
+
+
+# Gateway rows each backend table is compared with. Released auths (void) were
+# still auths in the backend, so they count on the auths side.
+RECON_TYPES = {"auths": ("auth", "void"), "payments": ("capture",)}
+RECON_MAX_IDS = 15  # per discrepancy line in the email; the console lists them all
+DATE_TYPES = {"datetime", "datetime2", "smalldatetime", "date", "datetimeoffset"}
+LOGIN_KEYS = {v.strip().lower(): k.strip().lower() for k, v in SLIMCD_CLIENT_IDS.items()}  # ClientID -> login
+
+
+def login_key(login):
+    """A usr_processors login and its SLIMCD_CLIENT_IDS ClientID compare equal."""
+    login = (login or "").strip().lower()
+    return LOGIN_KEYS.get(login, login)
+
+
+def sql_name(name):
+    """Bracket-quotes a configured table or column name (dotted parts kept)."""
+    return ".".join("[" + part.replace("]", "]]") + "]" for part in name.split("."))
+
+
+def reconcile(logins, start_dt, end_dt, notes, saved):
+    """Compares the window's gateway IDs with each configured backend table, both
+    ways, and stores discrepancies on the provider rows (row["recon"]). Each side
+    is checked against the other padded a day either way, so a transaction
+    logged just across midnight on one side isn't flagged. With saved, other
+    days' gateway IDs come from TXN_TABLE. Returns the number of discrepant IDs."""
+    rows = [row for login in logins for row in login["rows"]]
+    by_login = {}
+    for row in rows:
+        by_login.setdefault(login_key(row["login"]), row)  # a shared login goes to its first row
+    window, pad = (local(start_dt), local(end_dt)), (local(start_dt - timedelta(days=1)),
+                                                     local(end_dt + timedelta(days=1)))
+    total, unmatched, skipped = 0, defaultdict(list), set()
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        for kind, cfg in RECON.items():
+            if not cfg["table"]:
+                continue
+            types = RECON_TYPES[kind]
+
+            def col(name):
+                return f"ltrim(rtrim(replace({sql_name(name)}, '\"', '')))"
+
+            date_type = cur.execute("select type_name(system_type_id) from sys.columns "
+                                    "where object_id = object_id(?) and name = ?",
+                                    cfg["table"], cfg["date"]).fetchone()
+            if date_type and date_type[0] in DATE_TYPES:
+                when = sql_name(cfg["date"])  # filtered as-is, so an index on it can be used
+            else:
+                # Text dates (e.g. a CSV import): ISO 8601 cut to datetime's 3 decimals
+                # (no try_convert: TELCAN's compatibility level predates it).
+                iso = f"replace(left(replace({sql_name(cfg['date'])}, '\"', ''), 23), ' ', 'T')"
+                when = f"(case when isdate({iso}) = 1 then convert(datetime, {iso}, 126) end)"
+            system = {}  # id -> (login, time), padded window
+            for txn_id, login, at in cur.execute(
+                    f"select {col(cfg['id'])}, {col(cfg['login'])}, {when} from {sql_name(cfg['table'])} "
+                    f"where {when} >= ? and {when} < ?", *pad):
+                if txn_id:
+                    system[txn_id] = (login or "", at)
+
+            gateway_ids = set()  # padded window, transaction and related IDs
+            if saved:
+                marks = ", ".join("?" * len(types))
+                for txn_id, related_id in cur.execute(
+                        f"select transaction_id, related_id from {TXN_TABLE} "
+                        f"where txn_type in ({marks}) and txn_time >= ? and txn_time < ?", *types, *pad):
+                    gateway_ids.update(i for i in (txn_id, related_id) if i)
+
+            found = defaultdict(lambda: defaultdict(list))  # row_id -> direction -> ids
+            for row in rows:
+                if row["unavailable"]:
+                    continue
+                for t_kind, txn_id, _, _, _, related_id in row["txns"]:
+                    if t_kind not in types:
+                        continue
+                    gateway_ids.update(i for i in (txn_id, related_id) if i)
+                    match = txn_id if txn_id in system else related_id if related_id in system else None
+                    if match is None:
+                        found[row["row_id"]]["in gateway, not in system"].append(txn_id)
+                    elif login_key(system[match][0]) != login_key(row["login"]):
+                        found[row["row_id"]]["recorded in system under another login"].append(
+                            f"{txn_id} ({system[match][0] or 'blank'})")
+
+            for txn_id, (login, at) in system.items():
+                if not (window[0] <= at < window[1]) or txn_id in gateway_ids:
+                    continue
+                row = by_login.get(login_key(login))
+                if row is None:
+                    unmatched[(kind, login)].append(txn_id)
+                elif row["unavailable"]:
+                    skipped.add(f"{row['provider']} - {row['merchant']}")
+                else:
+                    found[row["row_id"]]["in system, not in gateway"].append(txn_id)
+
+            for row in rows:
+                for direction, ids in found.get(row["row_id"], {}).items():
+                    row["recon"].append((kind, direction, ids))
+                    total += len(ids)
+                    print(f"  {row['provider']} - {row['merchant']} ({row['gateway_id']}): {kind.title()} "
+                          f"{len(ids):,} {direction}: {', '.join(ids)}")
+    finally:
+        conn.close()
+
+    for (kind, login), ids in unmatched.items():
+        total += len(ids)
+        print(f"  {kind.title()} in system under unknown login {login or '(blank)'}: {', '.join(ids)}")
+        notes.append(f"{kind.title()}: {plural(len(ids), 'system transaction')} under login "
+                     f"{html.escape(login or '(blank)')} matched no usr_processors row: {html.escape(id_list(ids))}")
+    if skipped:
+        notes.append("Not reconciled because the gateway login was Unavailable: "
+                     + html.escape(", ".join(sorted(skipped))) + ".")
+    return total
+
+
+def id_list(ids):
+    shown = ", ".join(ids[:RECON_MAX_IDS])
+    return shown + (f" +{len(ids) - RECON_MAX_IDS:,} more" if len(ids) > RECON_MAX_IDS else "")
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +1000,14 @@ def extras_row(extras, indent):
             f'border-bottom:1px solid #eee;font-size:11px;color:#888;">{text}</td></tr>')
 
 
+def recon_row(recon, indent):
+    """Backend reconciliation discrepancies under a provider row."""
+    text = " &middot; ".join(f"<b>{kind.title()}:</b> {fmt_int(len(ids))} {direction}: {html.escape(id_list(ids))}"
+                             for kind, direction, ids in recon)
+    return (f'<tr style="background:#fdecea;"><td colspan="{len(COLUMNS) + 1}" style="padding:0 5px 6px '
+            f'{5 + indent}px;border-bottom:1px solid #eee;font-size:11px;color:#c0392b;">{text}</td></tr>')
+
+
 def build_table(logins):
     """Total, then website > provider - merchant, with subtotals on the website rows."""
     tree = defaultdict(list)
@@ -863,9 +1027,11 @@ def build_table(logins):
             label = (html.escape(f"{row['provider']} - {row['merchant']}") + '<div style="font-size:10px;color:#999;">'
                      + html.escape(row["gateway_id"]) + '</div>')
             parts.append(unavailable_row(label, 10) if row["unavailable"]
-                         else table_row(label, row["stats"], 10))
+                         else table_row(label, row["stats"], 10, "#fdecea" if row["recon"] else "#fff"))
             if row["extras"] and not row["unavailable"]:
                 parts.append(extras_row(row["extras"], 10))
+            if row["recon"]:
+                parts.append(recon_row(row["recon"], 10))
     parts.append("</table>")
     return "\n".join(parts)
 
@@ -1087,12 +1253,26 @@ def main():
     if len(failed) == len(logins):
         raise SystemExit("Every gateway login failed - not sending a report.")
 
+    saved = False
     if not args.no_save:
         try:
             print(f"Saved {save_transactions(logins, start_dt, end_dt):,} transaction IDs to {TXN_TABLE}")
+            saved = True
         except pyodbc.Error as e:
             print(f"Could not save transaction IDs to {TXN_TABLE}: {e.args[-1]}")
             notes.append(f"Transaction IDs could not be saved to {TXN_TABLE} for reconciliation.")
+
+    if any(cfg["table"] for cfg in RECON.values()):
+        print("Reconciling against the system ...")
+        try:
+            found = reconcile(logins, start_dt, end_dt, notes, saved)
+            print(f"  {found:,} discrepancies" if found else "  all matched")
+            if found:
+                notes.append(f"Reconciliation: {plural(found, 'transaction')} didn't match between the gateways and "
+                             "the system; see the highlighted provider rows.")
+        except pyodbc.Error as e:
+            print(f"Reconciliation could not run: {e.args[-1]}")
+            notes.append("Reconciliation could not run: " + html.escape(str(e.args[-1])[:200]))
 
     print("Building charts ...")
     specs = [
