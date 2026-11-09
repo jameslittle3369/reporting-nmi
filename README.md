@@ -1,7 +1,9 @@
-# IMT — NMI Transaction Report
+# IMT vs. Gateway Reconciliation
 
-Reports the previous day's **authorizations, captures, sales and refunds**, and
-which of the day's auths were captured, across every NMI merchant account. Sends
+Reports the previous day's **authorizations, captures, voids and refunds**, and
+which of the day's auths were captured, across every NMI, Stripe and SlimCD
+merchant account, and reconciles the gateway transaction IDs against the
+system's tables. Sends
 one HTML email via Amazon SES with summary bullets, a table grouped by website
 and provider - merchant, and breakdown charts.
 
@@ -114,6 +116,7 @@ locally instead of sending.
 | Captures | Successful `capture` actions dated yesterday — everything captured yesterday, including auths from earlier days, and including any later voided |
 | Voids | Yesterday's auths released or voided without capture, at their auth amount (left out of Auths). NMI: an auth with a void; Stripe: a charge refunded while uncaptured; SlimCD: a voided `AUTH` |
 | Refunds | Successful `refund` and `credit` actions dated yesterday |
+| Approval | **Auths ÷ (Auths + auth declines)**, with the declined count underneath. Only auth attempts count: no sales, and voids aren't in Auths. Auth declines are failed NMI `auth` actions, failed Stripe charges and SlimCD `AUTH` records with `approved=N` |
 
 **Sales** (`sale` actions, which auth and capture in one step) have no column.
 They're still counted in the volume charts, and if any occur a footnote gives
@@ -138,6 +141,7 @@ reword or reorder them without touching the script:
 | `{sales}` `{sales_amt}` `{sales_voided}` | Sales |
 | `{refunds}` `{refunds_amt}` | Refunds |
 | `{capture_rate}` | captured ÷ auths, e.g. `99.6%` |
+| `{approval_rate}` `{auth_declines}` | the Approval column's rate, and the auth declines behind it |
 | `{paid_out}` `{fees}` `{disputes}` `{disputed}` | Stripe-only payouts, fees, dispute count / amount |
 | `{period}` | the report date or range |
 
@@ -177,9 +181,16 @@ Approved `SALE` records are handled like NMI sales (see the footnote above).
 Declined `AUTH`/`SALE` records feed Decline Reasons, with the trailing response
 code removed. `SMS` receipt records are ignored.
 
-**Charts:** Volume by Website and Volume by Merchant (captures plus sales),
-Card Brands, Decline Reasons. Decline reasons are grouped case-insensitively
-across NMI and Stripe. Empty ones are listed in a compact "No activity in this period" note.
+**Charts:**
+- **Volume by Website** and **Volume by Merchant** (captures plus sales). Each
+  bar is labelled `$volume · N txns / X% approved`, where N is the captures
+  and sales behind the volume and X is the group's Approval.
+- **Volume by Card Brand** (captures plus sales per brand), labelled the same
+  way. The approval rate uses that brand's auths and auth declines.
+- **Decline Reasons**, which also counts sale declines, grouped
+  case-insensitively across gateways. Each bar is labelled `N · X% of
+  declines`, a share of all declines in the period, including reasons below
+  the top 12. Empty ones are listed in a compact "No activity in this period" note.
 
 ---
 

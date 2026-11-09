@@ -11,3 +11,4 @@ To match the 'Truth' we have to run at the same time.  Customer Service has the 
 #Captures: {captures_amt} ({captures})
 #Voids: {released_amt} ({released} released auths)
 #Refunds: {refunds_amt} ({refunds})
+Approval Rates:  {approval_rate} ({auth_declines})

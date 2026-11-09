@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-nmi_report.py
+nmi_report.py - IMT vs. Gateway Reconciliation
 -------------
-Reports the previous day's NMI gateway activity - authorizations, captures,
-sales and refunds, and which of the day's auths were captured - across every
-NMI merchant account, and sends one HTML email via Amazon SES.
+Reports the previous day's gateway activity (NMI, Stripe and SlimCD) -
+authorizations, captures, voids and refunds, and which of the day's auths were
+captured - across every merchant account, reconciles the gateway transaction
+IDs against the system's tables, and sends one HTML email via Amazon SES.
 
 The merchant list and gateway logins come from the TELCAN database
 (usr_processors rows with cc_gateway='N'), so a new merchant is picked up
@@ -115,6 +116,7 @@ if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
     ses_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
 ses = boto3.client("sesv2", **ses_kwargs)
 
+REPORT_NAME = "IMT vs. Gateway Reconciliation"
 CURRENCY = "usd"
 RESULT_LIMIT = 1000
 ACCOUNTS_SQL = """
@@ -351,7 +353,7 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
                 continue
             stats["auths"] += 1
             stats["auths_amt"] += amt
-            breakdowns["brands"][tx["cc_type"] or None] += 1
+            breakdowns["brand_auths"][tx["cc_type"] or None] += 1
             if captures:
                 stats["captured"] += 1
                 stats["captured_amt"] += captured_amt
@@ -363,16 +365,13 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
             stats["captures"] += 1
             stats["captures_amt"] += amt
             stats["captures_voided"] += voided
-            breakdowns["website_volume"][row["website"]] += amt
-            breakdowns["volume"][row["merchant"]] += amt
+            add_volume(breakdowns, row, tx["cc_type"] or None, amt)
             record(row, "capture", tx["id"], amt, a["when"])
         elif kind == "sale":
             stats["sales"] += 1
             stats["sales_amt"] += amt
             stats["sales_voided"] += voided
-            breakdowns["website_volume"][row["website"]] += amt
-            breakdowns["volume"][row["merchant"]] += amt
-            breakdowns["brands"][tx["cc_type"] or None] += 1
+            add_volume(breakdowns, row, tx["cc_type"] or None, amt)
             record(row, "sale", tx["id"], amt, a["when"])
         elif kind in ("refund", "credit"):
             stats["refunds"] += 1
@@ -382,6 +381,17 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
     for a in tx["actions"]:
         if not a["success"] and a["type"] in ("auth", "sale") and in_window(a):
             add_decline(breakdowns, re.sub(r"\s*REFID:\S+", "", a["response_text"]).strip())
+            if a["type"] == "auth":
+                stats["auth_declines"] += 1
+                breakdowns["brand_auth_declines"][tx["cc_type"] or None] += 1
+
+
+def add_volume(breakdowns, row, brand, amount):
+    """A capture or sale's amount on the volume charts (website, merchant, card brand)."""
+    breakdowns["website_volume"][row["website"]] += amount
+    breakdowns["volume"][row["merchant"]] += amount
+    breakdowns["brand_volume"][brand] += amount
+    breakdowns["brand_txns"][brand] += 1
 
 
 def record(row, kind, txn_id, amount, when, status=None, related_id=None):
@@ -444,10 +454,17 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
     payouts = fetch(client.v1.payouts, {"arrival_date": {"gte": start_ts, "lt": end_ts}})
     disputes = fetch(client.v1.disputes, created)
 
+    def card_brand(charge):
+        pmd = (charge.get("payment_method_details") if isinstance(charge, dict) else None) or {}
+        return (pmd.get("card") or pmd.get("card_present") or {}).get("brand")
+
     stats = row["stats"]
     for c in charges:
+        brand = card_brand(c)
         if c["status"] == "failed":
             add_decline(breakdowns, nice_label((c.get("outcome") or {}).get("reason") or c.get("failure_code")))
+            stats["auth_declines"] += 1  # manual capture only, so every charge is an auth
+            breakdowns["brand_auth_declines"][brand] += 1
         elif c["status"] == "succeeded":
             if c.get("refunded") and not c.get("captured"):  # released without capture
                 stats["released"] += 1
@@ -457,8 +474,7 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             amt = major(c["amount"])
             stats["auths"] += 1
             stats["auths_amt"] += amt
-            pmd = c.get("payment_method_details") or {}
-            breakdowns["brands"][(pmd.get("card") or pmd.get("card_present") or {}).get("brand")] += 1
+            breakdowns["brand_auths"][brand] += 1
             if c.get("captured"):
                 stats["captured"] += 1
                 stats["captured_amt"] += major(c.get("amount_captured"))
@@ -472,8 +488,7 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             amt = major(b["amount"])
             stats["captures"] += 1
             stats["captures_amt"] += amt
-            breakdowns["website_volume"][row["website"]] += amt
-            breakdowns["volume"][row["merchant"]] += amt
+            add_volume(breakdowns, row, card_brand(b.get("source")), amt)
             record(row, "capture", source_id(b), amt, stamp(b["created"]))
         elif b["type"] in STRIPE_REFUND_TYPES:
             stats["refunds"] += 1
@@ -571,6 +586,9 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
         if r["approved"] == "N":
             if kind in ("AUTH", "SALE"):
                 add_decline(breakdowns, re.sub(r"\s+\d+$", "", r["proc_response"]))
+            if kind == "AUTH":
+                stats["auth_declines"] += 1
+                breakdowns["brand_auth_declines"][r["brand"]] += 1
             continue
         if r["approved"] != "Y":
             continue
@@ -582,7 +600,7 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
                 continue
             stats["auths"] += 1
             stats["auths_amt"] += amt
-            breakdowns["brands"][r["brand"]] += 1
+            breakdowns["brand_auths"][r["brand"]] += 1
             if r["gateid"] in open_auths:
                 stats["pending"] += 1
                 stats["pending_amt"] += amt
@@ -599,16 +617,13 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             stats["captures"] += 1
             stats["captures_amt"] += amt
             stats["captures_voided"] += r["voided"]
-            breakdowns["website_volume"][row["website"]] += amt
-            breakdowns["volume"][row["merchant"]] += amt
+            add_volume(breakdowns, row, r["brand"], amt)
             record(row, "capture", r["gateid"], amt, r["when"], related_id=auth_of.get(r["gateid"]))
         elif kind == "SALE":
             stats["sales"] += 1
             stats["sales_amt"] += amt
             stats["sales_voided"] += r["voided"]
-            breakdowns["website_volume"][row["website"]] += amt
-            breakdowns["volume"][row["merchant"]] += amt
-            breakdowns["brands"][r["brand"]] += 1
+            add_volume(breakdowns, row, r["brand"], amt)
             record(row, "sale", r["gateid"], amt, r["when"])
         elif kind == "CREDIT":
             stats["refunds"] += 1
@@ -782,22 +797,28 @@ def reconcile(logins, start_dt, end_dt, notes, saved):
             def col(name):
                 return f"ltrim(rtrim(replace({sql_name(name)}, '\"', '')))"
 
-            date_type = cur.execute("select type_name(system_type_id) from sys.columns "
-                                    "where object_id = object_id(?) and name = ?",
-                                    cfg["table"], cfg["date"]).fetchone()
-            if date_type and date_type[0] in DATE_TYPES:
-                when = sql_name(cfg["date"])  # filtered as-is, so an index on it can be used
-            else:
-                # Text dates (e.g. a CSV import): ISO 8601 cut to datetime's 3 decimals
-                # (no try_convert: TELCAN's compatibility level predates it).
-                iso = f"replace(left(replace({sql_name(cfg['date'])}, '\"', ''), 23), ' ', 'T')"
-                when = f"(case when isdate({iso}) = 1 then convert(datetime, {iso}, 126) end)"
             system = {}  # id -> (login, time), padded window
-            for txn_id, login, at in cur.execute(
-                    f"select {col(cfg['id'])}, {col(cfg['login'])}, {when} from {sql_name(cfg['table'])} "
-                    f"where {when} >= ? and {when} < ?", *pad):
-                if txn_id:
-                    system[txn_id] = (login or "", at)
+            try:  # a bad table or column name skips just this comparison
+                date_type = cur.execute("select type_name(system_type_id) from sys.columns "
+                                        "where object_id = object_id(?) and name = ?",
+                                        cfg["table"], cfg["date"]).fetchone()
+                if date_type and date_type[0] in DATE_TYPES:
+                    when = sql_name(cfg["date"])  # filtered as-is, so an index on it can be used
+                else:
+                    # Text dates (e.g. a CSV import): ISO 8601 cut to datetime's 3 decimals
+                    # (no try_convert: TELCAN's compatibility level predates it).
+                    iso = f"replace(left(replace({sql_name(cfg['date'])}, '\"', ''), 23), ' ', 'T')"
+                    when = f"(case when isdate({iso}) = 1 then convert(datetime, {iso}, 126) end)"
+                for txn_id, login, at in cur.execute(
+                        f"select {col(cfg['id'])}, {col(cfg['login'])}, {when} from {sql_name(cfg['table'])} "
+                        f"where {when} >= ? and {when} < ?", *pad):
+                    if txn_id:
+                        system[txn_id] = (login or "", at)
+            except pyodbc.Error as e:
+                print(f"  {kind.title()} reconciliation could not run: {e.args[-1]}")
+                notes.append(f"{kind.title()} reconciliation could not run ({html.escape(cfg['table'])}): "
+                             + html.escape(str(e.args[-1])[:200]))
+                continue
 
             gateway_ids = set()  # padded window, transaction and related IDs
             if saved:
@@ -893,26 +914,31 @@ def axis_formatter(fmt):
     return money if fmt == "money" else (lambda x, _: f"{int(x):,}")
 
 
-def bar_spec(title, counter, fmt="int", top=12, labeler=nice_label):
-    rows = [(labeler(k), v) for k, v in sorted(counter.items(), key=lambda kv: kv[1], reverse=True) if v]
+def bar_spec(title, counter, fmt="int", top=12, labeler=nice_label, suffix=None):
+    """suffix maps a key to extra text shown after its bar's value."""
+    suffix = suffix or {}
+    rows = [(labeler(k), v, suffix.get(k)) for k, v in sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
+            if v]
     return {"id": safe_id(title), "title": title, "rows": rows[:top], "fmt": fmt}
 
 
 def make_bar_chart(spec):
-    """Horizontal bar chart of (label, value) rows."""
+    """Horizontal bar chart of (label, value, suffix) rows."""
     labels = [r[0] for r in spec["rows"]]
     values = [r[1] for r in spec["rows"]]
+    suffixes = [r[2] for r in spec["rows"]]
     maxv = max(values) if values else 1
 
     fig, ax = plt.subplots(figsize=(7, max(2.5, len(labels) * 0.4 + 1)))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#F8F9FA")
     bars = ax.barh(labels, values, color=PALETTE[0], height=0.6)
-    for bar, v in zip(bars, values):
+    for bar, v, extra in zip(bars, values, suffixes):
         ax.text(bar.get_width() + maxv * 0.015, bar.get_y() + bar.get_height() / 2,
-                fmt_value(v, spec["fmt"]), va="center", fontsize=8, color="#333")
+                fmt_value(v, spec["fmt"]) + (f"  ·  {extra}" if extra else ""), va="center", fontsize=8,
+                color="#333")
     ax.set_ylim(max(len(labels), 3) - 0.5, -0.5)  # top-down order; keeps 1-2 bars from filling the plot
-    ax.set_xlim(0, maxv * 1.18)
+    ax.set_xlim(0, maxv * (1.6 if any(suffixes) else 1.18))  # room for the value text
     ax.xaxis.set_major_formatter(plt.FuncFormatter(axis_formatter(spec["fmt"])))
     ax.set_title(spec["title"], fontsize=13, fontweight="bold", pad=10)
     ax.spines[["top", "right", "left"]].set_visible(False)
@@ -963,8 +989,17 @@ def inline_images_for_preview(html_body, images):
 COLUMNS = [
     ("Auths", "auths", "auths_amt"), ("Pending Auths", "pending", "pending_amt"),
     ("Captures", "captures", "captures_amt"), ("Voids", "released", "released_amt"),
-    ("Refunds", "refunds", "refunds_amt"),
+    ("Refunds", "refunds", "refunds_amt"), ("Approval", "auth_declines", None),  # None: see approval()
 ]
+
+
+def approval(auths, declines):
+    """Auths / (Auths + auth declines); sales and released auths aren't counted."""
+    return auths / (auths + declines) if auths + declines else None
+
+
+def fmt_pct(rate):
+    return f"{rate:.1%}" if rate is not None else "n/a"
 
 
 def add_stats(rows):
@@ -978,7 +1013,14 @@ def table_row(label, stats, indent=0, bg="#fff", weight=400):
     td = f'padding:6px 5px;border-bottom:1px solid #eee;font-size:12px;font-weight:{weight};'
     cells = [f'<td style="{td}padding-left:{5 + indent}px;">{label}</td>']
     for _, count, amount in COLUMNS:
-        if stats[count]:
+        if amount is None:
+            rate = approval(stats["auths"], stats[count])
+            if rate is None:
+                cells.append(f'<td align="right" style="{td}color:#ccc;">&mdash;</td>')
+            else:
+                cells.append(f'<td align="right" style="{td}">{fmt_pct(rate)}<div style="font-size:10px;'
+                             f'color:#999;font-weight:400;">{fmt_int(stats[count])} declined</div></td>')
+        elif stats[count]:
             cells.append(f'<td align="right" style="{td}">{fmt_money(stats[amount])}'
                          f'<div style="font-size:10px;color:#999;font-weight:400;">{fmt_int(stats[count])}</div></td>')
         else:
@@ -1069,13 +1111,13 @@ def build_email_html(report_date, days, summary_html, table_html, charts_html, n
         "<head>",
         '<meta charset="UTF-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
-        "<title>IMT NMI Report | " + report_date + "</title>",
+        "<title>" + REPORT_NAME + " | " + report_date + "</title>",
         "</head>",
         '<body style="margin:0;padding:0;background:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;">',
         '<div style="max-width:700px;margin:32px auto;background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.1);">',
         '<!--[if gte mso 9]><v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true" stroke="false" style="mso-width-percent:1000;"><v:fill type="gradient" color="#8B8CF6" color2="#4B45C6" angle="135"/><v:textbox style="mso-fit-shape-to-text:true" inset="0,0,0,0"><![endif]-->',
         '<div style="background-color:#8B8CF6;background:linear-gradient(135deg,#8B8CF6 0%,#4B45C6 100%);padding:28px 32px;">',
-        '<div style="color:#fff;font-size:20px;font-weight:700;">IMT NMI Report | ' + report_date + '</div>',
+        '<div style="color:#fff;font-size:20px;font-weight:700;">' + REPORT_NAME + ' | ' + report_date + '</div>',
         "</div>",
         '<!--[if gte mso 9]></v:textbox></v:rect><![endif]-->',
         '<div style="padding:24px 32px;">',
@@ -1085,7 +1127,7 @@ def build_email_html(report_date, days, summary_html, table_html, charts_html, n
         charts_html,
         notes_html,
         '<p style="margin:32px 0 0;font-size:11px;color:#aaa;text-align:center;">',
-        f"Generated {ts_str} &bull; IMT NMI Report &bull; {period}",
+        f"Generated {ts_str} &bull; {REPORT_NAME} &bull; {period}",
         "</p>",
         "</div>",
         "</div>",
@@ -1139,7 +1181,7 @@ def send_email(subject, html_body, to_addresses, images=None):
 def parse_args():
     """Also resolves the report period into args.start_dt (midnight, TIMEZONE)
     and an exclusive args.end_dt."""
-    p = argparse.ArgumentParser(description="NMI transaction report emailed via AWS SES")
+    p = argparse.ArgumentParser(description=REPORT_NAME + " report emailed via AWS SES")
     period = p.add_mutually_exclusive_group()
     period.add_argument("--days", type=int, default=None,
                         help="Last N full days ending yesterday (overrides REPORT_DAYS)")
@@ -1179,7 +1221,7 @@ def parse_args():
 
 
 SUMMARY_COUNTS = ["auths", "captured", "pending", "released", "captures", "captures_voided",
-                  "sales", "sales_voided", "refunds", "disputes"]
+                  "sales", "sales_voided", "refunds", "disputes", "auth_declines"]
 SUMMARY_AMOUNTS = ["auths_amt", "captured_amt", "pending_amt", "released_amt", "captures_amt",
                    "sales_amt", "refunds_amt", "paid_out", "fees", "disputed"]
 DEFAULT_SUMMARY = [
@@ -1206,6 +1248,7 @@ def build_summary(totals, extras, report_date):
     values = {k: fmt_int(stats[k]) for k in SUMMARY_COUNTS}
     values.update({k: fmt_money(stats[k]) for k in SUMMARY_AMOUNTS})
     values["capture_rate"] = f"{stats['captured'] / stats['auths']:.1%}" if stats["auths"] else "n/a"
+    values["approval_rate"] = fmt_pct(approval(stats["auths"], stats["auth_declines"]))
     values["period"] = report_date
 
     items = []
@@ -1247,7 +1290,8 @@ def main():
 
     print(f"Fetching NMI transactions ({days}-day window) ...")
     notes = []
-    breakdowns = {"website_volume": Counter(), "volume": Counter(), "brands": Counter(), "declines": Counter(),
+    breakdowns = {"website_volume": Counter(), "volume": Counter(), "brand_volume": Counter(), "brand_txns": Counter(),
+                  "brand_auths": Counter(), "brand_auth_declines": Counter(), "declines": Counter(),
                   "decline_labels": {}}
     failed = collect(logins, start_dt, end_dt, breakdowns, notes)
     if len(failed) == len(logins):
@@ -1275,11 +1319,34 @@ def main():
             notes.append("Reconciliation could not run: " + html.escape(str(e.args[-1])[:200]))
 
     print("Building charts ...")
+
+    def volume_suffix(field):
+        """'N txns / X% approved' per website or merchant; N is the captures and sales
+        behind the bar's volume."""
+        groups = defaultdict(list)
+        for login in logins:
+            for row in login["rows"]:
+                groups[row[field]].append(row)
+        out = {}
+        for key, rows in groups.items():
+            s = add_stats(rows)
+            out[key] = (f"{plural(s['captures'] + s['sales'], 'txn')} / "
+                        f"{fmt_pct(approval(s['auths'], s['auth_declines']))} approved")
+        return out
+
+    brand_suffix = {k: f"{plural(breakdowns['brand_txns'][k], 'txn')} / "
+                       f"{fmt_pct(approval(breakdowns['brand_auths'][k], breakdowns['brand_auth_declines'][k]))} approved"
+                    for k in breakdowns["brand_volume"]}
+    total_declines = sum(breakdowns["declines"].values())
+    decline_suffix = {k: f"{v / total_declines:.1%} of declines" for k, v in breakdowns["declines"].items()}
     specs = [
-        bar_spec("Volume by Website", breakdowns["website_volume"], "money", labeler=lambda k: k),
-        bar_spec("Volume by Merchant", breakdowns["volume"], "money", labeler=lambda k: k),
-        bar_spec("Card Brands", breakdowns["brands"]),
-        bar_spec("Decline Reasons", breakdowns["declines"], labeler=breakdowns["decline_labels"].get),
+        bar_spec("Volume by Website", breakdowns["website_volume"], "money", labeler=lambda k: k,
+                 suffix=volume_suffix("website")),
+        bar_spec("Volume by Merchant", breakdowns["volume"], "money", labeler=lambda k: k,
+                 suffix=volume_suffix("merchant")),
+        bar_spec("Volume by Card Brand", breakdowns["brand_volume"], "money", suffix=brand_suffix),
+        bar_spec("Decline Reasons", breakdowns["declines"], labeler=breakdowns["decline_labels"].get,
+                 suffix=decline_suffix),
     ]
     pngs = {s["id"]: make_bar_chart(s) for s in specs if s["rows"]}
     email_images = {chart_cid(s): pngs[s["id"]][0] for s in specs if s["id"] in pngs}
@@ -1298,7 +1365,7 @@ def main():
     print("Composing email ...")
     html_body = build_email_html(report_date, days, summary_html, build_table(logins),
                                  build_charts_html(specs, pngs), notes, failed)
-    subject = "IMT NMI Report | " + report_date + (" (incomplete)" if failed else "")
+    subject = REPORT_NAME + " | " + report_date + (" (incomplete)" if failed else "")
     file_name = "IMT_NMI_" + (end_dt - timedelta(days=1)).strftime("%Y%m%d") + "_email.html"
 
     if args.preview or not FROM_ADDRESS or not to_addresses:
