@@ -99,6 +99,9 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 FROM_ADDRESS = os.getenv("FROM_ADDRESS", "")
 FROM_NAME    = os.getenv("FROM_NAME", "James Little")
 TO_ADDRESSES = [a.strip() for a in os.getenv("TO_ADDRESSES", "").split(",") if a.strip()]
+# Recipients of the separate email with the transaction and customer details of
+# gateway transactions missing from the system. Blank = saved locally instead.
+MISSING_TO_ADDRESSES = [a.strip() for a in os.getenv("MISSING_TO_ADDRESSES", "").split(",") if a.strip()]
 
 REPORT_DAYS = int(os.getenv("REPORT_DAYS", "1"))
 TIMEZONE    = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
@@ -173,6 +176,32 @@ def plural(n, word) -> str:
     return f"{n:,.0f} {word}" + ("" if n == 1 else "s")
 
 
+# Gateway fields never copied into the missing-transactions email: hashes, tokens,
+# bank account / ID numbers and 3-D Secure cryptograms.
+DETAIL_EXCLUDE = {"cc_hash", "check_hash", "check_account", "check_aba", "social_security_number",
+                  "drivers_license_number", "drivers_license_dob", "drivers_license_state", "customertaxid",
+                  "cavv", "xid", "signature_image", "card_identifier", "token_or_card_number",
+                  "accountnumber", "routeno", "checkid", "cardid", "fingerprint", "client_secret"}
+DETAIL_EXCLUDE_PARTS = ("password", "secret", "token", "hash", "fingerprint")
+CARD_NUMBER_FIELDS = {"cc_number", "cardnumber"}
+
+
+def detail_fields(pairs, prefix=""):
+    """Non-empty (name, value) pairs for the missing-transactions email, without
+    sensitive fields; card numbers are cut to their last four digits."""
+    out = {}
+    for name, value in pairs:
+        if value in (None, "") or name in DETAIL_EXCLUDE or any(p in name for p in DETAIL_EXCLUDE_PARTS):
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        if name in CARD_NUMBER_FIELDS:
+            value = "**** " + re.sub(r"\D", "", value)[-4:]
+        out[prefix + name] = value
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Merchant accounts (TELCAN database)
 # ---------------------------------------------------------------------------
@@ -220,6 +249,7 @@ def load_logins():
             "unavailable": False,
             "txns": [],  # gateway IDs saved to TXN_TABLE for backend reconciliation
             "recon": [],  # (kind, direction, ids) discrepancies from reconcile()
+            "details": {},  # gateway ID -> transaction / customer fields, for the missing-transactions email
         })
     return list(logins.values())
 
@@ -267,11 +297,15 @@ def parse_action(el):
         "success": el.findtext("success") == "1",
         "response_text": el.findtext("response_text") or "",
         "raw_date": raw,
+        "fields": detail_fields((c.tag, when.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                 if c.tag == "date" and when else c.text)
+                                for c in el if c.tag not in ("action_type", "success")),
     }
 
 
 def parse_transaction(el):
     return {
+        "fields": detail_fields((c.tag, c.text) for c in el if c.tag != "action"),
         "id": el.findtext("transaction_id"),
         "condition": el.findtext("condition"),
         "processor_id": (el.findtext("processor_id") or "").strip(),
@@ -343,6 +377,9 @@ def tally(tx, stats, start_dt, end_dt, breakdowns, row):
     def in_window(a):
         return a["when"] is not None and start_dt <= a["when"] < end_dt
 
+    if any(map(in_window, done)):  # each action's fields labelled by its type, e.g. auth_response_text
+        row["details"][tx["id"]] = {**tx["fields"], **{f"{a['type']}_{k}": v for a in done
+                                                      for k, v in a["fields"].items()}}
     for a in filter(in_window, done):
         kind, amt = a["type"], a["amount"]
         if kind == "auth":
@@ -449,6 +486,29 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
         src = b.get("source")
         return intent_id(src) if isinstance(src, dict) else (src or b["id"])
 
+    def flat(obj, prefix=""):  # nested dict -> (dotted name, value) pairs; lists are skipped
+        for k, v in (obj or {}).items():
+            if isinstance(v, dict):
+                yield from flat(v, f"{prefix}{k}.")
+            elif not isinstance(v, (list, bool)):
+                yield prefix + k, v
+
+    def details(obj):  # a charge or refund, with its PaymentIntent's metadata when expanded
+        pi = obj.get("payment_intent")
+        out = {"PaymentIntent": intent_id(obj), "Object": obj.get("object"), "ID": obj.get("id"),
+               "Amount": fmt_money(major(obj.get("amount"))),
+               "Created": stamp(obj["created"]).astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")}
+        out.update(detail_fields((k, obj.get(k)) for k in ("status", "customer", "description", "receipt_email",
+                                                           "statement_descriptor", "charge", "reason")))
+        out.update(detail_fields(flat(obj.get("billing_details"), "billing.")))
+        out.update(detail_fields(flat((obj.get("payment_method_details") or {}).get("card"), "card.")))
+        out.update(detail_fields(flat(obj.get("outcome"), "outcome.")))
+        out.update(detail_fields(flat(obj.get("metadata"), "metadata.")))
+        if isinstance(pi, dict):
+            out.update(detail_fields(flat(pi.get("metadata"), "payment_intent.metadata.")))
+            out.update(detail_fields((f"payment_intent.{k}", pi.get(k)) for k in ("description", "customer")))
+        return out
+
     def abandoned(charge):  # the PaymentIntent was cancelled as abandoned before capture
         pi = charge.get("payment_intent")
         return (isinstance(pi, dict) and pi.get("status") == "canceled"
@@ -471,6 +531,8 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             skipped += 1
             continue
         brand = card_brand(c)
+        if c["status"] == "succeeded":
+            row["details"][intent_id(c)] = details(c)
         if c["status"] == "failed":
             add_decline(breakdowns, nice_label((c.get("outcome") or {}).get("reason") or c.get("failure_code")))
             stats["auth_declines"] += 1  # manual capture only, so every charge is an auth
@@ -494,6 +556,8 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
             record(row, "auth", intent_id(c), amt, stamp(c["created"]), "captured" if c.get("captured") else "pending")
 
     for b in bts:
+        if isinstance(b.get("source"), dict) and b["type"] in STRIPE_CHARGE_TYPES | STRIPE_REFUND_TYPES:
+            row["details"].setdefault(source_id(b), details(b["source"]))  # a window charge's own details win
         if b["type"] in STRIPE_CHARGE_TYPES:
             amt = major(b["amount"])
             stats["captures"] += 1
@@ -553,6 +617,7 @@ def parse_slimcd(el):
         "gateid": text("gateid"), "when": when, "type": text("transtype").upper(), "approved": text("approved"),
         "amount": amount, "brand": SLIMCD_BRANDS.get(card, card.lower() or None), "cardid": text("cardid"),
         "siteid": text("siteid"), "voided": text("voided") not in ("", "0"), "proc_response": text("proc_response"),
+        "fields": detail_fields((c.tag, c.text) for c in el),
     }
 
 
@@ -602,6 +667,7 @@ def fetch_slimcd(session, login, row, start_dt, end_dt, breakdowns, notes):
             continue
         if r["approved"] != "Y":
             continue
+        row["details"][r["gateid"]] = r["fields"]
         if kind == "AUTH":
             if r["voided"]:  # released without capture; left out of the total, matching NMI and Stripe
                 stats["released"] += 1
@@ -887,6 +953,79 @@ def reconcile(logins, start_dt, end_dt, notes, saved):
 def id_list(ids):
     shown = ", ".join(ids[:RECON_MAX_IDS])
     return shown + (f" +{len(ids) - RECON_MAX_IDS:,} more" if len(ids) > RECON_MAX_IDS else "")
+
+
+# ---------------------------------------------------------------------------
+# Missing-transactions email (gateway IDs not in the system, with their details)
+# ---------------------------------------------------------------------------
+
+MISSING_DIRECTION = "in gateway, not in system"
+# Candidate fields per gateway (NMI, SlimCD, Stripe) for the customer line on each card.
+CUSTOMER_NAME = (("first_name", "last_name"), ("firstname", "lastname"), ("billing.name",))
+CUSTOMER_CONTACT = ("email", "billing.email", "receipt_email", "phone", "cell_phone", "billing.phone")
+
+
+def missing_transactions(logins):
+    """(login, row, txn, details) for each gateway transaction reconcile() found
+    missing from the system. txn is the row["txns"] tuple."""
+    items = []
+    for login in logins:
+        for row in login["rows"]:
+            for recon_kind, direction, ids in row["recon"]:
+                if direction != MISSING_DIRECTION:
+                    continue
+                for txn_id in ids:
+                    txn = next((t for t in row["txns"] if t[1] == txn_id and t[0] in RECON_TYPES[recon_kind]),
+                               None)
+                    if txn:
+                        items.append((login, row, txn, row["details"].get(txn_id, {})))
+    return items
+
+
+def field_label(name):
+    """'billing.address.line1' -> 'Billing Address Line1'; labels already capitalized stay as-is."""
+    return name if name[:1].isupper() else name.replace(".", " ").replace("_", " ").title()
+
+
+def build_missing_html(items, report_date):
+    cell = 'style="padding:3px 10px 3px 0;font-size:12px;vertical-align:top;'
+    cards = []
+    for login, row, (kind, txn_id, amount, when, status, _), details in items:
+        name = next((" ".join(details[k] for k in keys if k in details) for keys in CUSTOMER_NAME
+                     if any(k in details for k in keys)), "")
+        contact = list(dict.fromkeys(details[k] for k in CUSTOMER_CONTACT if k in details))
+        customer = " &middot; ".join(html.escape(v) for v in [name, *contact] if v) or "No customer details returned"
+        title = (f"{kind.title()}{' (' + status + ')' if status else ''} &middot; {fmt_money(amount)} &middot; "
+                 + local(when).strftime("%b %d, %Y %I:%M:%S %p"))
+        fields = "".join(f'<tr><td {cell}color:#888;white-space:nowrap;">{html.escape(field_label(k))}</td>'
+                         f'<td {cell}color:#333;word-break:break-all;">{html.escape(v)}</td></tr>'
+                         for k, v in details.items())
+        cards.append(
+            '<div style="border:1px solid #e3e5ea;border-radius:8px;padding:14px 16px;margin:0 0 16px;">'
+            f'<div style="font-size:15px;font-weight:700;color:#222;">{title}</div>'
+            f'<div style="font-size:13px;color:#333;margin:4px 0;">{customer}</div>'
+            f'<div style="font-size:12px;color:#666;margin:0 0 10px;">{html.escape(row["provider"])} - '
+            f'{html.escape(row["merchant"])} ({html.escape(row["gateway_id"])}) &middot; login '
+            f'{html.escape(row["login"] or "(blank)")} &middot; Gateway ID <b>{html.escape(txn_id)}</b></div>'
+            f'<table style="border-collapse:collapse;">{fields}</table></div>')
+    title = "Gateway Transactions Missing from the System"
+    return "\n".join([
+        "<!DOCTYPE html>", "<html>", "<head>", '<meta charset="UTF-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        f"<title>{title} | {report_date}</title>", "</head>",
+        '<body style="margin:0;padding:0;background:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;">',
+        '<div style="max-width:700px;margin:32px auto;background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.1);">',
+        '<div style="background-color:#C0392B;padding:24px 32px;border-radius:12px 12px 0 0;">',
+        f'<div style="color:#fff;font-size:20px;font-weight:700;">{title} | {report_date}</div></div>',
+        '<div style="padding:24px 32px;">',
+        f'<p style="margin:0 0 20px;font-size:14px;color:#333;">{plural(len(items), "gateway transaction")} '
+        f'from {REPORT_NAME} had no matching record in the system. Each one is listed with every '
+        'transaction and customer field its gateway returned (card numbers show the last 4 digits only).</p>',
+        *cards,
+        f'<p style="margin:24px 0 0;font-size:11px;color:#aaa;text-align:center;">Generated '
+        f'{datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %Z")} &bull; {REPORT_NAME}</p>',
+        "</div>", "</div>", "</body>", "</html>",
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -1327,6 +1466,10 @@ def main():
         except pyodbc.Error as e:
             print(f"Reconciliation could not run: {e.args[-1]}")
             notes.append("Reconciliation could not run: " + html.escape(str(e.args[-1])[:200]))
+    missing = missing_transactions(logins)
+    if missing:
+        notes.append(f"Transaction and customer details for the {plural(len(missing), 'gateway transaction')} "
+                     "missing from the system are sent in a separate email.")
 
     print("Building charts ...")
 
@@ -1388,6 +1531,21 @@ def main():
         print(f"Sending to {', '.join(to_addresses)} ...")
         send_email(subject, html_body, to_addresses, images=email_images)
         print("Done! Report sent successfully.")
+
+    if missing:  # separate email, its own recipients (--to overrides both)
+        missing_to = args.to or MISSING_TO_ADDRESSES
+        missing_html = build_missing_html(missing, report_date)
+        if args.preview or not FROM_ADDRESS or not missing_to:
+            if not (FROM_ADDRESS and missing_to) and not args.preview:
+                print("FROM_ADDRESS or MISSING_TO_ADDRESSES not set in .env - saving locally instead of sending.")
+            missing_file = file_name.replace("_email.html", "_missing.html")
+            with open(missing_file, "w", encoding="utf-8") as f:
+                f.write(missing_html)
+            print(f"Saved missing-transactions preview to {missing_file} ({plural(len(missing), 'transaction')})")
+        else:
+            print(f"Sending {plural(len(missing), 'missing transaction')} to {', '.join(missing_to)} ...")
+            send_email(f"Missing from System | {report_date} ({len(missing):,})", missing_html, missing_to)
+            print("Done! Missing-transactions email sent.")
 
 
 if __name__ == "__main__":

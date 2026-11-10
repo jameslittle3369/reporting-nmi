@@ -276,6 +276,31 @@ the total. The discrepancy types are:
 - **recorded in system under another login:** the ID matches, but the system
   logged it under a different `cc_gateway_username` than the provider's.
 
+### Missing-from-system email
+
+When any transaction is **in gateway, not in system**, a second email titled
+"Missing from System | <date> (N)" goes to `MISSING_TO_ADDRESSES`. These
+recipients are separate from `TO_ADDRESSES`. The email has one card per
+transaction: type, amount and time, then the customer's name, email and phone,
+the provider, merchant, login and gateway ID, and then every field the gateway
+returned for it:
+
+- **NMI:** the transaction's fields (customer, billing and shipping address,
+  AVS/CVV, card type and BIN) and each action's fields, labelled by action, e.g.
+  `Capture Date`, `Settle Batch Id`.
+- **Stripe:** the charge (or refund), billing details, card, outcome and the
+  charge's and PaymentIntent's metadata (e.g. username, load ID).
+- **SlimCD:** every field on the transaction record.
+
+Card numbers are cut to the last 4 digits. Hashes, tokens, bank account and
+routing numbers, ID/SSN fields and 3-D Secure cryptograms are left out
+(`DETAIL_EXCLUDE` in the script).
+
+The main report gets a footnote that the details were sent separately. With
+`--preview`, or a blank `MISSING_TO_ADDRESSES`, the email is saved as
+`IMT_NMI_YYYYMMDD_missing.html` instead. `--to` overrides the recipients of both
+emails.
+
 How matching works:
 - **Midnight:** each side is checked against the other a day either way, so a
   transaction logged at 23:59 on one side and 00:01 on the other isn't
