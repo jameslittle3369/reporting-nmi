@@ -449,8 +449,14 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
         src = b.get("source")
         return intent_id(src) if isinstance(src, dict) else (src or b["id"])
 
-    charges = fetch(client.v1.charges, created)
-    bts = fetch(client.v1.balance_transactions, {**created, "expand": ["data.source"]})
+    def abandoned(charge):  # the PaymentIntent was cancelled as abandoned before capture
+        pi = charge.get("payment_intent")
+        return (isinstance(pi, dict) and pi.get("status") == "canceled"
+                and pi.get("cancellation_reason") == "abandoned" and not charge.get("captured"))
+
+    # The PaymentIntent is expanded for its cancellation_reason (see abandoned()).
+    charges = fetch(client.v1.charges, {**created, "expand": ["data.payment_intent"]})
+    bts =fetch(client.v1.balance_transactions, {**created, "expand": ["data.source"]})
     payouts = fetch(client.v1.payouts, {"arrival_date": {"gte": start_ts, "lt": end_ts}})
     disputes = fetch(client.v1.disputes, created)
 
@@ -459,7 +465,11 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
         return (pmd.get("card") or pmd.get("card_present") or {}).get("brand")
 
     stats = row["stats"]
+    skipped = 0
     for c in charges:
+        if abandoned(c):  # checkout abandoned within the minute: not a real auth, and the CRM never logs it
+            skipped += 1
+            continue
         brand = card_brand(c)
         if c["status"] == "failed":
             add_decline(breakdowns, nice_label((c.get("outcome") or {}).get("reason") or c.get("failure_code")))
@@ -501,7 +511,7 @@ def fetch_stripe(row, start_dt, end_dt, breakdowns, other_currency):
         "disputes": len(disputes),
         "disputed": sum(major(d["amount"]) for d in disputes),
     }
-    return (f"{len(charges):,} charges, {len(bts):,} balance transactions, "
+    return (f"{len(charges):,} charges ({skipped:,} abandoned, skipped), {len(bts):,} balance transactions, "
             f"{len(payouts):,} payouts, {len(disputes):,} disputes")
 
 

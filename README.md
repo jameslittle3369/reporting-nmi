@@ -154,7 +154,11 @@ website rows. Providers are the `usr_processors` rows with `cc_gateway='N'` (NMI
 `'S'` (Stripe).
 
 **Stripe row:** uses the same definitions as the Stripe report. Auths are the
-day's succeeded charges, excluding ones released without capture. Captures and
+day's succeeded charges, excluding ones released without capture. Charges whose
+PaymentIntent was cancelled before capture with reason `abandoned` (an abandoned
+checkout, cancelled within the minute) aren't real auths and are skipped
+entirely: not counted as auths, voids or declines, and not reconciled, since
+the CRM never logs them. The console shows how many were skipped. Captures and
 refunds come from the day's balance transactions, so captures include auths from
 earlier days. A small **Stripe only** line under the row shows payouts paid,
 fees and disputes, which NMI has no equivalent for. The account uses manual
